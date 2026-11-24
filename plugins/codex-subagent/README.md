@@ -36,3 +36,13 @@ Create or update a profile with `subagent_define_profile` in MCP, **Handoff & Co
 Omitted settings inherit the local defaults for new profiles and the saved settings when updating profiles. The bridge saves profiles in `codex_subagent_state.json` and `profiles/<name>.json`. It injects the system prompt as Codex developer instructions when starting the thread and prepends it to each new turn's task context. Existing conversations keep their thread settings after a profile edit. New conversations use the saved profile.
 
 The local bridge exposes `GET /api/profiles`, `POST /api/profiles/define`, and `POST /api/profiles/delete`. Delete takes `{"name": "<profile>" }` and removes the generated definitions. Agent definitions owned by another tool or the user cause a conflict during registration.
+
+## Taking Over Existing Standalone Codex Sessions & Managing Permissions
+
+- **Take Over / Adopt Existing Codex Sessions**:
+  - Use MCP tools `subagent_list_codex_sessions` and `subagent_adopt_codex_session(threadId="...")` (or `GET /api/codex/threads` + `POST /api/codex/adopt`, press **`t`** in the `tmux` Split-View TUI, click **📥 Take Over Session** in the Sidecar Web UI, or use `[ADOPT:<threadId>]` in `invoke_subagent` / `send_message`).
+  - The bridge attaches to the running or persisted thread via `thread/resume`, imports historical turns via `thread/turns/list` into `transcript.jsonl`, and enables full mid-turn steering (`turn/steer`), interruption, fork, and revert.
+- **Permission Inheritance (`~/.codex/config.toml`) & One-Click Bypass**:
+  - `permissionSource: "codexConfig"` (default): automatically reads `approval_policy` and `sandbox_mode` from `~/.codex/config.toml`.
+  - `permissionSource: "bypass"`: forces `approvalPolicy="never"` and `sandboxMode="danger-full-access"` (zero prompts, full access).
+  - `permissionSource: "custom"`: allows explicit per-session or per-profile `approvalPolicy` (`never`, `on-request`, `untrusted`, `inherit`) and `sandboxMode` (`danger-full-access`, `workspace-write`, `read-only`, `inherit`), dynamically hot-swappable mid-session via `thread/settings/update` (`subagent_configure`, `[PERMISSION:bypass]`, TUI key **`P`**, or Web UI **⚡ One-Click Bypass Permissions**).

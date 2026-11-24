@@ -632,6 +632,79 @@ class CodexAppServerClient:
     def turn_interrupt(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
         return self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
+    def thread_list(
+        self,
+        limit: int = 30,
+        cursor: Optional[str] = None,
+        search_term: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if search_term:
+            params["searchTerm"] = search_term
+        if cwd:
+            params["cwd"] = cwd
+        return self.request("thread/list", params)
+
+    def thread_loaded_list(self) -> Dict[str, Any]:
+        return self.request("thread/loaded/list", {})
+
+    def thread_turns_list(
+        self,
+        thread_id: str,
+        limit: int = 20,
+        sort_direction: str = "desc",
+        items_view: str = "full",
+    ) -> Dict[str, Any]:
+        return self.request(
+            "thread/turns/list",
+            {
+                "threadId": thread_id,
+                "limit": limit,
+                "sortDirection": sort_direction,
+                "itemsView": items_view,
+            },
+        )
+
+    @staticmethod
+    def sandbox_mode_to_policy(sandbox_mode: str, cwd: Optional[str] = None) -> Dict[str, Any]:
+        if sandbox_mode == "danger-full-access":
+            return {"type": "dangerFullAccess"}
+        if sandbox_mode == "read-only":
+            return {"type": "readOnly", "networkAccess": True}
+        roots = [cwd] if cwd and os.path.isabs(cwd) else []
+        return {
+            "type": "workspaceWrite",
+            "writableRoots": roots,
+            "networkAccess": True,
+            "excludeTmpdirEnvVar": False,
+            "excludeSlashTmp": False,
+        }
+
+    def thread_settings_update(
+        self,
+        thread_id: str,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        sandbox_mode: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"threadId": thread_id}
+        if model is not None:
+            params["model"] = model
+        if effort is not None:
+            params["effort"] = effort
+        if approval_policy in ("never", "on-request", "untrusted"):
+            params["approvalPolicy"] = approval_policy
+        if sandbox_mode in ("read-only", "workspace-write", "danger-full-access"):
+            params["sandboxPolicy"] = self.sandbox_mode_to_policy(sandbox_mode, cwd)
+        if cwd:
+            params["cwd"] = cwd
+        return self.request("thread/settings/update", params)
+
     def turn_settings_update(
         self,
         thread_id: str,

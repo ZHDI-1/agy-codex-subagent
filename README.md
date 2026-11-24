@@ -38,19 +38,20 @@ The installer writes the selected mode to `plugins/codex-subagent/config.json` a
 
 A Markdown fallback still uses the hook in SDK mode. When switching modes, start a fresh Antigravity session to load the generated definition. An already-running bridge from the previous plugin version must be restarted to load the new API.
 
-The default Codex settings are `gpt-6.2-sol`, `xhigh`, `never` approvals, and `danger-full-access` sandbox mode. Set `sandboxMode` and `approvalPolicy` in the local config or in a profile to override them.
+The default Codex settings are `gpt-6.2-sol`, `xhigh`, and `permissionSource: "codexConfig"` (which automatically inherits `approval_policy` and `sandbox_mode` directly from `~/.codex/config.toml`, falling back to `never` approvals and `danger-full-access` sandbox mode). You can also switch any session or profile to `permissionSource: "bypass"` (one-click `never` + `danger-full-access`) or `permissionSource: "custom"` (`read-only` / `workspace-write` / `danger-full-access` and `never` / `on-request` / `untrusted`) live via `thread/settings/update`.
 
 ## Usage
 
-### 1. Natural Language Subagent Delegation in `agy`
+### 1. Natural Language Subagent Delegation & Taking Over Existing Codex Sessions
 Ask the main agent naturally:
 - *"Spawn a `codex` subagent to audit and fix the race condition in `src/`."*
+- *"List my existing Codex sessions and take over thread `019d...` with bypass permissions."*
 - *"Steer the running `codex` subagent: do not modify public headers, only internal implementation."*
 - *"Hand off the findings from the `research` subagent to a `codex` subagent to implement the fix."*
 
 ### 2. Define a Codex profile
 
-Call the MCP tool `subagent_define_profile`, open **Handoff & Config** in Mission Control, or press **p** in the TUI. For example, a profile named `codex-reviewer` can use model `gpt-6.2-sol`, effort `high`, and the system prompt “Review changes for correctness and test gaps.” Invoke it with `invoke_subagent(TypeName="codex-reviewer")`. The bridge writes native definitions in the workspace and global config. `subagent_list_profiles` returns the saved profiles.
+Call the MCP tool `subagent_define_profile`, open **Handoff & Config** in Mission Control, or press **p** in the TUI. For example, a profile named `codex-reviewer` can use model `gpt-6.2-sol`, effort `high`, `permissionSource: "codexConfig"` (or `"bypass"` / `"custom"`), and the system prompt “Review changes for correctness and test gaps.” Invoke it with `invoke_subagent(TypeName="codex-reviewer")`. The bridge writes native definitions in the workspace and global config. `subagent_list_profiles` returns the saved profiles and the detected `~/.codex/config.toml` settings.
 
 ### 3. `send_message` Control Prefixes
 When messaging a `codex` subagent via `send_message(Recipient=<conversationId>, Message=...)`:
@@ -60,6 +61,8 @@ When messaging a `codex` subagent via `send_message(Recipient=<conversationId>, 
 - `[INTERRUPT]` or `[INTERRUPT] <new_task>`: Abort current turn (`turn/interrupt`).
 - `[REVERT:N]`: Drop and revert the last `N` turns (`thread/revert`).
 - `[EFFORT:low|medium|high|xhigh|ultra]` / `[MODEL:<model>]`: Update reasoning effort or model (`turn/settings/update`).
+- `[PERMISSION:bypass|codexConfig|never:danger-full-access|on-request:workspace-write]`: Dynamically update Codex approval policy and sandbox mode (`thread/settings/update`).
+- `[ADOPT:<threadId>] <optional prompt>`: Directly take over an existing standalone Codex session (`thread/resume` + `thread/turns/list`), importing its historical turns into `transcript.jsonl`.
 - `[COMPACT]`: Trigger context compaction (`thread/compact/start`).
 
 ### 4. Opening the Mission Control UI
@@ -76,6 +79,8 @@ python3 plugins/codex-subagent/bin/codex_mission_control_tui.py --split --all
   - `s`: Mid-Turn Steer (`turn/steer`)
   - `q`: Queue Next (`thread/queue/add`)
   - `i`: Interrupt active turn
+  - `t`: Take Over / Adopt an existing standalone Codex session (`thread/list` + `thread/resume`)
+  - `P` (`Shift+p`): Adjust Codex permissions live (`bypass` / `codexConfig` from `~/.codex/config.toml` / custom `approval:sandbox`)
   - `F` (`Shift+f`): Fork Codex thread (`thread/fork`)
   - `r`: Revert last `N` turns/steps
   - `m`: Change reasoning effort

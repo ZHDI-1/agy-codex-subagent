@@ -53,7 +53,7 @@ class MissionControlTUI:
         self.selected_conv_id: str = ""
         self.detail: Optional[Dict[str, Any]] = None
         self.scroll_offset = 0
-        self.status_banner = "Ready — [s] Steer  [q] Queue  [i] Interrupt  [f] Fork  [r] Revert  [h] Handoff  [p] Profiles"
+        self.status_banner = "Ready — [s]Steer [q]Queue [i]Interrupt [t]TakeOver [P]Perms [F]Fork [r]Revert [p]Profiles"
         self.codex_connected = False
         self.codex_ua = ""
         self.ls_addr = ""
@@ -194,10 +194,20 @@ class MissionControlTUI:
             )
         )
         if summary.get("threadId"):
+            adopted_tag = " [ADOPTED]" if summary.get("isAdopted") else ""
+            perm_src = summary.get("permissionSource") or "codexConfig"
+            perm_ap = summary.get("approvalPolicy") or "never"
+            perm_sb = summary.get("sandboxMode") or "danger-full-access"
             lines.append(
                 (
-                    f"Codex Thread: {summary.get('threadId')}  ActiveTurn: {summary.get('activeTurnId') or 'idle'}",
+                    f"Codex Thread: {summary.get('threadId')}{adopted_tag}  Turn: {summary.get('activeTurnId') or 'idle'}",
                     curses.color_pair(2),
+                )
+            )
+            lines.append(
+                (
+                    f"Permissions: {perm_src} (approval={perm_ap}, sandbox={perm_sb})",
+                    curses.color_pair(3),
                 )
             )
         lines.append(("─" * max(10, width - 2), curses.A_DIM))
@@ -360,7 +370,7 @@ class MissionControlTUI:
                 self.safe_addstr(stdscr, detail_start_y + i, 1, text, attr)
 
             # 5. Bottom Control & Status Bars
-            ctrl_bar = " [s]Steer [q]Queue [i]Interrupt [F]Fork [r]Revert [m]Effort [p]Profiles [h]Handoff [Q]Quit "
+            ctrl_bar = " [s]Steer [q]Queue [i]Intr [t]TakeOver [P]Perms [F]Fork [r]Rev [m]Effort [p]Prof [h]Handoff [Q]Quit "
             self.safe_addstr(stdscr, h - 2, 0, ctrl_bar.ljust(max(0, w - 1)), curses.color_pair(1) | curses.A_REVERSE)
             self.safe_addstr(stdscr, h - 1, 0, f" {self.status_banner}", curses.color_pair(3))
 
@@ -474,6 +484,66 @@ class MissionControlTUI:
                         self.status_banner = f"Config failed: {e}"
             elif ch == ord("p"):
                 self.manage_profile(stdscr)
+            elif ch == ord("t"):
+                try:
+                    t_res = fetch_json(f"{self.base_url}/api/codex/threads?limit=9", timeout=3.0)
+                    threads = t_res.get("threads") or []
+                    hints = " ".join(
+                        f"{idx + 1}:{'*' if t.get('isLoaded') else ''}{t['threadId'][:8]}"
+                        for idx, t in enumerate(threads[:5])
+                    )
+                    ans = self.prompt_input(stdscr, f"TakeOver (1-{len(threads)} or threadId) [{hints[:42]}]: ")
+                    if ans:
+                        target_tid = ans
+                        if ans.isdigit() and 1 <= int(ans) <= len(threads):
+                            target_tid = threads[int(ans) - 1]["threadId"]
+                        prompt_msg = self.prompt_input(stdscr, "Optional steer prompt (Enter to attach only): ")
+                        res = post_json(
+                            f"{self.base_url}/api/codex/adopt",
+                            {
+                                "threadId": target_tid,
+                                "permissionSource": "codexConfig",
+                                **({"prompt": prompt_msg} if prompt_msg else {}),
+                            },
+                        )
+                        self.selected_conv_id = res.get("conversationId", self.selected_conv_id)
+                        self.status_banner = (
+                            f"Took over thread {target_tid[:10]} -> {self.selected_conv_id[:12]} "
+                            f"({res.get('hydratedTurns', 0)} turns)"
+                        )
+                        self.refresh_data(force_detail=True)
+                except Exception as e:
+                    self.status_banner = f"TakeOver failed: {e}"
+            elif ch == ord("P") and self.selected_conv_id:
+                choice = self.prompt_input(
+                    stdscr,
+                    "Perms (bypass / codexConfig / never:danger-full-access / on-request:workspace-write): ",
+                ).strip()
+                if choice:
+                    try:
+                        payload: Dict[str, Any] = {"conversationId": self.selected_conv_id}
+                        cl = choice.lower()
+                        if cl in ("bypass", "b", "full"):
+                            payload.update(
+                                permissionSource="bypass",
+                                approvalPolicy="never",
+                                sandboxMode="danger-full-access",
+                            )
+                        elif cl in ("codexconfig", "config", "c", "toml"):
+                            payload.update(permissionSource="codexConfig")
+                        elif ":" in cl:
+                            ap, sb = [x.strip() for x in cl.split(":", 1)]
+                            payload.update(permissionSource="custom", approvalPolicy=ap, sandboxMode=sb)
+                        else:
+                            payload.update(permissionSource="custom", sandboxMode=cl)
+                        res = post_json(f"{self.base_url}/api/subagent/configure", payload)
+                        self.status_banner = (
+                            f"Updated perms: {res.get('permissionSource')} "
+                            f"({res.get('approvalPolicy')}/{res.get('sandboxMode')})"
+                        )
+                        self.refresh_data(force_detail=True)
+                    except Exception as e:
+                        self.status_banner = f"Permission update failed: {e}"
             elif ch == ord("h") and self.selected_conv_id:
                 task = self.prompt_input(stdscr, "Handoff task instruction to Codex: ")
                 if task:

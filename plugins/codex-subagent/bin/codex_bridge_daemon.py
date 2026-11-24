@@ -52,7 +52,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from codex_profiles import (
     PROFILE_DIR, apply_files, definition_changes, live_sdk_instance, load_config, load_profiles, normalize_profile,
-    validate_name, validate_settings, write_object,
+    read_codex_config_toml, resolve_effective_permissions, validate_name, validate_settings, write_object,
 )
 from codex_ws_client import CodexAppServerClient, CodexRpcError
 
@@ -74,7 +74,7 @@ SYSTEM_MSG_TAG_RE = re.compile(
     re.DOTALL,
 )
 PREFIX_CMD_RE = re.compile(
-    r"^\s*\[(STEER|QUEUE|INTERRUPT|REVERT(?::\d+)?|COMPACT|APPROVE|DECLINE|MODEL:[^\]]+|EFFORT:[^\]]+)\]\s*(.*)$",
+    r"^\s*\[(STEER|QUEUE|INTERRUPT|REVERT(?::\d+)?|COMPACT|APPROVE|DECLINE|MODEL:[^\]]+|EFFORT:[^\]]+|ADOPT:[^\]]+|PERMISSION:[^\]]+)\]\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -372,7 +372,11 @@ class UnifiedSubagentBridge:
 
     def list_profiles(self) -> Dict[str, Any]:
         with self.lock:
-            return {"profiles": [dict(self.profiles[name]) for name in sorted(self.profiles)], "defaults": load_config()}
+            return {
+                "profiles": [dict(self.profiles[name]) for name in sorted(self.profiles)],
+                "defaults": load_config(),
+                "codexConfigToml": read_codex_config_toml(),
+            }
 
     def define_profile(self, body: Dict[str, Any]) -> Dict[str, Any]:
         name = validate_name(body.get("name"))
@@ -398,8 +402,6 @@ class UnifiedSubagentBridge:
         return {"deleted": True, "name": name}
 
     def _persist_profiles(self, updated: Dict[str, Any], changes: Dict[Path, Optional[str]]) -> None:
-        # Commit the native definitions and both persistent profile representations together.
-        # The caller holds self.lock through publication.
         changes[self.state_file] = json.dumps({
             "lsAddress": self.ls_address, "csrfToken": self.csrf_token,
             "updatedAt": utc_now_iso(), "sessions": self.sessions_by_conv, "profiles": updated,
@@ -423,13 +425,19 @@ class UnifiedSubagentBridge:
             if agent_name not in self.profiles:
                 raise ValueError(f"Unknown Codex profile {agent_name!r}")
             settings.update(self.profiles[agent_name])
+        perm_src, eff_ap, eff_sb = resolve_effective_permissions(
+            settings.get("permissionSource"),
+            settings.get("approvalPolicy"),
+            settings.get("sandboxMode"),
+        )
         return {
             "conversationId": conversation_id, "parentConversationId": "", "agentName": agent_name,
             "engine": "codex", "role": "Codex Subagent", "cwd": "", "transcriptPath": "",
             "threadId": None, "activeTurnId": None, "status": "idle", "executionMode": "preInvocation",
             "model": settings["model"], "effort": settings["effort"],
-            "sandbox": settings["sandboxMode"], "approvalPolicy": settings["approvalPolicy"],
-            "approvalMode": "interactive", "systemPrompt": settings.get("systemPrompt", ""),
+            "permissionSource": perm_src, "sandbox": eff_sb, "approvalPolicy": eff_ap,
+            "approvalMode": "interactive",
+            "systemPrompt": settings.get("systemPrompt", ""),
             "stepCount": 0, "nextStepIndex": 0, "turnHistory": [], "events": [],
             "createdAt": utc_now_iso(), "updatedAt": utc_now_iso(),
         }
@@ -783,12 +791,22 @@ class UnifiedSubagentBridge:
                     session.update(lsAddress=ls_address, csrfToken=csrf_token or "")
 
             try:
-                self._ensure_thread(session)
                 directive = PREFIX_CMD_RE.match(clean_text)
-                if directive:
-                    result = self._execute_directive(session, directive[1].upper(), directive[2].strip())
+                if directive and directive[1].upper().startswith("ADOPT:"):
+                    raw_target_tid = directive[1].split(":", 1)[1].strip()
+                    result = self.adopt_codex_thread(
+                        thread_id=raw_target_tid,
+                        conversation_id=conversation_id,
+                        parent_conversation_id=session.get("parentConversationId") or extracted_parent,
+                        role=role or session.get("role"),
+                        prompt=directive[2].strip() or None,
+                    )
                 else:
-                    result = self._dispatch_turn(session, clean_text, additional_context)
+                    self._ensure_thread(session)
+                    if directive:
+                        result = self._execute_directive(session, directive[1].upper(), directive[2].strip())
+                    else:
+                        result = self._dispatch_turn(session, clean_text, additional_context)
             except Exception as e:
                 with self.lock:
                     if session["status"] == "starting" or not session.get("threadId"):
@@ -966,6 +984,28 @@ class UnifiedSubagentBridge:
             if remainder:
                 return self._dispatch_turn(session, remainder)
             return {"action": "turn/settings/update", key: value, "result": result.get("settingsUpdate")}
+
+        if directive.startswith("PERMISSION:"):
+            spec = directive.split(":", 1)[1].strip()
+            spec_lower = spec.lower()
+            kwargs: Dict[str, Any] = {}
+            if spec_lower in ("bypass", "full", "auto"):
+                kwargs["permission_source"] = "bypass"
+            elif spec_lower in ("codexconfig", "config", "toml", "inherit"):
+                kwargs["permission_source"] = "codexConfig"
+            elif ":" in spec_lower:
+                ap_part, sb_part = [p.strip() for p in spec_lower.split(":", 1)]
+                kwargs.update(permission_source="custom", approval_policy=ap_part, sandbox_mode=sb_part)
+            elif spec_lower in ("never", "on-request", "untrusted"):
+                kwargs.update(permission_source="custom", approval_policy=spec_lower)
+            elif spec_lower in ("read-only", "workspace-write", "danger-full-access"):
+                kwargs.update(permission_source="custom", sandbox_mode=spec_lower)
+            else:
+                raise ValueError(f"Unsupported PERMISSION directive value: {spec}")
+            result = self.configure_subagent(conv_id, **kwargs)
+            if remainder:
+                return self._dispatch_turn(session, remainder)
+            return {"action": "thread/settings/update", "conversationId": conv_id, "threadId": thread_id, **result}
 
         if directive in ("APPROVE", "DECLINE"):
             decision = "accept" if directive == "APPROVE" else "decline"
@@ -1676,6 +1716,10 @@ class UnifiedSubagentBridge:
                 "cwd": sess.get("cwd") or existing.get("cwd") or "",
                 "threadId": sess.get("threadId"),
                 "activeTurnId": sess.get("activeTurnId"),
+                "permissionSource": sess.get("permissionSource", "codexConfig"),
+                "approvalPolicy": sess.get("approvalPolicy", "never"),
+                "sandboxMode": sess.get("sandbox", "danger-full-access"),
+                "isAdopted": bool(sess.get("isAdopted")),
                 "hasDiff": bool(sess.get("latestDiff")),
                 "planCount": len(sess.get("plan") or []),
                 "pendingApprovals": conv_approvals,
@@ -2017,12 +2061,383 @@ class UnifiedSubagentBridge:
                 "result": send_res,
             }
 
+    def list_codex_threads(
+        self,
+        limit: int = 25,
+        search_term: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Lists existing standalone or active Codex threads from the running `codex app-server` daemon
+        (`thread/loaded/list` + `thread/list`) so users or the parent agent can take over any existing session.
+        """
+        self.codex.connect()
+        loaded_ids: set[str] = set()
+        try:
+            loaded_res = self.codex.thread_loaded_list()
+            loaded_ids = set(loaded_res.get("data") or [])
+        except Exception as e:
+            logger.debug("thread_loaded_list failed: %s", e)
+
+        list_res = self.codex.thread_list(limit=max(1, min(100, int(limit))), search_term=search_term, cwd=cwd)
+        raw_threads = list(list_res.get("data") or [])
+        seen_ids = {t.get("id") for t in raw_threads if isinstance(t, dict) and t.get("id")}
+
+        # Ensure any currently loaded in-memory threads not in the top N list are included
+        for lid in list(loaded_ids):
+            if lid and lid not in seen_ids:
+                try:
+                    t_res = self.codex.thread_read(lid, include_turns=False)
+                    t_obj = t_res.get("thread")
+                    if isinstance(t_obj, dict) and t_obj.get("id"):
+                        raw_threads.insert(0, t_obj)
+                        seen_ids.add(lid)
+                except Exception:
+                    pass
+
+        with self.lock:
+            conv_map = dict(self.conv_by_thread)
+
+        threads: List[Dict[str, Any]] = []
+        for t in raw_threads:
+            if not isinstance(t, dict) or not t.get("id"):
+                continue
+            tid = str(t["id"])
+            adopted_cid = conv_map.get(tid)
+            status_obj = t.get("status")
+            status_type = status_obj.get("type", "idle") if isinstance(status_obj, dict) else str(status_obj or "idle")
+            threads.append({
+                "threadId": tid,
+                "preview": str(t.get("preview") or "").strip()[:240],
+                "cwd": str(t.get("cwd") or ""),
+                "model": str(t.get("model") or ""),
+                "reasoningEffort": str(t.get("reasoningEffort") or ""),
+                "status": status_type,
+                "isLoaded": tid in loaded_ids,
+                "isAdopted": bool(adopted_cid),
+                "adoptedConversationId": adopted_cid,
+                "originator": str(t.get("originator") or ""),
+                "source": str(t.get("source") or ""),
+                "createdAt": t.get("createdAt"),
+                "updatedAt": t.get("updatedAt"),
+                "name": t.get("name"),
+            })
+
+        threads.sort(
+            key=lambda item: (
+                0 if item.get("isLoaded") else 1,
+                -(int(item.get("updatedAt") or 0)),
+            )
+        )
+        return {
+            "codexConnected": self.codex.is_connected(),
+            "loadedThreadIds": sorted(loaded_ids),
+            "codexConfigToml": read_codex_config_toml(),
+            "threads": threads[: max(1, min(100, int(limit)))],
+        }
+
+    def _hydrate_adopted_thread_turns(self, session: Dict[str, Any], thread_id: str) -> int:
+        """
+        Backfills existing turns from an adopted Codex thread via `thread/turns/list` into
+        the subagent's `transcript.jsonl` and `turnHistory`.
+        """
+        with self.lock:
+            existing_turns = {t.get("turnId") for t in (session.get("turnHistory") or []) if isinstance(t, dict)}
+
+        try:
+            turns_res = self.codex.thread_turns_list(
+                thread_id=thread_id,
+                limit=20,
+                sort_direction="desc",
+                items_view="full",
+            )
+            turns = list(reversed(turns_res.get("data") or []))
+        except Exception as e:
+            logger.debug("thread_turns_list on adopted thread %s returned: %s", thread_id, e)
+            return 0
+
+        hydrated = 0
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            turn_id = str(turn.get("id") or "")
+            if not turn_id or turn_id in existing_turns:
+                continue
+            turn_status = str(turn.get("status") or "completed")
+            items = turn.get("items") or []
+            turn_thinking_parts: List[str] = []
+            turn_agent_messages: List[str] = []
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                itype = item.get("type", "")
+                iid = str(item.get("id") or uuid.uuid4())
+                if itype == "userMessage":
+                    content_list = item.get("content") or []
+                    user_texts = [
+                        str(c.get("text") or "")
+                        for c in content_list
+                        if isinstance(c, dict) and c.get("text")
+                    ]
+                    user_text = "\n".join(user_texts).strip()
+                    if user_text:
+                        self._append_transcript_step(session, {
+                            "source": "USER_EXPLICIT",
+                            "type": "USER_INPUT",
+                            "status": "DONE",
+                            "content": user_text,
+                        })
+                elif itype == "reasoning":
+                    summaries = item.get("summary") or []
+                    contents = item.get("content") or []
+                    r_text = "\n".join(str(x) for x in (summaries or contents) if x).strip()
+                    if r_text:
+                        turn_thinking_parts.append(r_text)
+                elif itype == "commandExecution":
+                    cmd_str = str(item.get("command") or "")
+                    cwd_str = str(item.get("cwd") or session.get("cwd") or "")
+                    agg_out = str(item.get("aggregatedOutput") or "")
+                    exit_code = item.get("exitCode")
+                    self._append_transcript_step(session, {
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "model": session.get("model") or "codex",
+                        "thinking": turn_thinking_parts[-1] if turn_thinking_parts else "",
+                        "tool_calls": [{
+                            "id": iid,
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": json.dumps(cmd_str),
+                                "Cwd": json.dumps(cwd_str),
+                                "toolSummary": json.dumps(f"Run {cmd_str[:64]}"),
+                            },
+                        }],
+                    })
+                    if agg_out or exit_code is not None:
+                        self._append_transcript_step(session, {
+                            "source": "MODEL",
+                            "type": "GENERIC",
+                            "status": "DONE" if exit_code in (0, None) else "ERROR",
+                            "content": f"Command: {cmd_str}\nExit Code: {exit_code}\nOutput:\n{agg_out[:3000]}",
+                        })
+                elif itype == "fileChange":
+                    changes = item.get("changes") or []
+                    first_path = changes[0].get("path", "file") if changes and isinstance(changes[0], dict) else "file"
+                    self._append_transcript_step(session, {
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "model": session.get("model") or "codex",
+                        "thinking": turn_thinking_parts[-1] if turn_thinking_parts else "",
+                        "tool_calls": [{
+                            "id": iid,
+                            "name": "edit_file",
+                            "args": {
+                                "Path": json.dumps(first_path),
+                                "toolSummary": json.dumps(f"Edit {Path(first_path).name}"),
+                            },
+                        }],
+                    })
+                elif itype == "agentMessage":
+                    msg_txt = str(item.get("text") or "").strip()
+                    if msg_txt:
+                        turn_agent_messages.append(msg_txt)
+
+            combined_thinking = "\n\n".join(turn_thinking_parts).strip()
+            combined_msg = "\n\n".join(turn_agent_messages).strip()
+            if combined_msg or combined_thinking:
+                self._append_transcript_step(session, {
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "ERROR" if turn_status == "failed" else "DONE",
+                    "model": session.get("model") or "codex",
+                    "thinking": combined_thinking,
+                    "response": combined_msg or f"Turn {turn_id} ({turn_status})",
+                    "tool_calls": [],
+                })
+            with self.lock:
+                if combined_thinking:
+                    session["lastThinking"] = combined_thinking[-2000:]
+                if combined_msg:
+                    session["lastAgentMessage"] = combined_msg
+                if turn_status in ("inProgress", "running", "working", "active"):
+                    session["activeTurnId"] = turn_id
+                    session["status"] = "working"
+                    session["currentActivity"] = "Adopted active turn in progress..."
+                else:
+                    session.setdefault("turnHistory", []).append({
+                        "turnId": turn_id,
+                        "status": turn_status,
+                        "completedAt": utc_now_iso(),
+                        "summary": (combined_msg or combined_thinking)[:500],
+                    })
+            existing_turns.add(turn_id)
+            hydrated += 1
+        return hydrated
+
+    def adopt_codex_thread(
+        self,
+        thread_id: str,
+        conversation_id: Optional[str] = None,
+        parent_conversation_id: Optional[str] = None,
+        role: Optional[str] = None,
+        prompt: Optional[str] = None,
+        permission_source: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        sandbox_mode: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Directly takes over an existing Codex session (`threadId`) from `codex app-server`:
+        1. Calls `thread/resume` (with fallback to `thread/read`) to subscribe our WebSocket connection
+           to live events from that thread and inspect its metadata.
+        2. Binds it to an Antigravity subagent `conversationId` and hydrates historical turns into
+           `transcript.jsonl` so it appears in `agy`, TUI Split-View, and Web Sidecar UI.
+        3. Optionally updates permissions (`codexConfig` from `~/.codex/config.toml`, `bypass`, or `custom`)
+           via `thread/settings/update` and optionally dispatches an immediate steering/follow-up `prompt`.
+        """
+        clean_tid = str(thread_id or "").strip()
+        if not clean_tid:
+            raise ValueError("threadId is required to adopt an existing Codex session")
+
+        self.codex.connect()
+        connection = self.codex.connection
+
+        with self.lock:
+            existing_cid = self.conv_by_thread.get(clean_tid)
+            target_cid = conversation_id or existing_cid or (
+                f"codex-adopted-{re.sub(r'[^A-Za-z0-9_.-]', '', clean_tid)[:16] or uuid.uuid4().hex[:12]}"
+            )
+        self._validate_conversation_id(target_cid)
+
+        with self._conversation_lock(target_cid):
+            try:
+                resumed = self.codex.thread_resume(clean_tid, cwd=cwd)
+            except CodexRpcError as e:
+                if "no rollout found" in e.message.lower():
+                    resumed = self.codex.thread_read(clean_tid, include_turns=False)
+                else:
+                    raise
+
+            thread_obj = resumed.get("thread") or {}
+            live_cwd = cwd or resumed.get("cwd") or thread_obj.get("cwd") or os.getcwd()
+            cfg = load_config()
+            live_model = model or resumed.get("model") or thread_obj.get("model") or cfg["model"]
+            live_effort = effort or resumed.get("reasoningEffort") or thread_obj.get("reasoningEffort") or cfg["effort"]
+            preview = str(thread_obj.get("preview") or "").strip()
+            status_obj = thread_obj.get("status")
+            raw_status = status_obj.get("type", "idle") if isinstance(status_obj, dict) else "idle"
+
+            perm_src = permission_source or cfg.get("permissionSource", "codexConfig")
+            perm_src, eff_ap, eff_sb = resolve_effective_permissions(
+                perm_src,
+                approval_policy or cfg.get("approvalPolicy", "inherit"),
+                sandbox_mode or cfg.get("sandboxMode", "inherit"),
+            )
+
+            with self.lock:
+                if existing_cid and existing_cid != target_cid:
+                    old_sess = self.sessions_by_conv.get(existing_cid)
+                    if old_sess and old_sess.get("threadId") == clean_tid:
+                        old_sess["threadId"] = None
+                session = self.sessions_by_conv.get(target_cid)
+                if session is None:
+                    session = self._new_session(target_cid, "codex")
+                    self.sessions_by_conv[target_cid] = session
+                old_tid = session.get("threadId")
+                if old_tid and old_tid != clean_tid:
+                    self.conv_by_thread.pop(old_tid, None)
+                    self._thread_connections.pop(old_tid, None)
+
+                computed_role = (
+                    role
+                    or (session.get("role") if session.get("role") not in ("", None, "Codex Subagent") else None)
+                    or (f"Adopted: {preview[:36]}" if preview else f"Adopted Codex ({clean_tid[:8]})")
+                )
+                session.update(
+                    threadId=clean_tid,
+                    isAdopted=True,
+                    role=computed_role,
+                    cwd=live_cwd,
+                    model=live_model,
+                    effort=live_effort,
+                    permissionSource=perm_src,
+                    approvalPolicy=eff_ap,
+                    sandbox=eff_sb,
+                    approvalMode="auto_accept" if eff_ap == "never" else "interactive",
+                    status="working" if raw_status in ("running", "working", "inProgress", "active") else "idle",
+                    currentActivity=f"Adopted thread {clean_tid[:12]}" + (f": {preview[:80]}" if preview else ""),
+                    updatedAt=utc_now_iso(),
+                )
+                if parent_conversation_id:
+                    session["parentConversationId"] = parent_conversation_id
+                self.conv_by_thread[clean_tid] = target_cid
+                self._thread_connections[clean_tid] = connection
+
+            # Apply permission/model/effort settings onto the adopted thread if supported
+            if permission_source or approval_policy or sandbox_mode or model or effort:
+                try:
+                    self.codex.thread_settings_update(
+                        thread_id=clean_tid,
+                        model=model,
+                        effort=effort,
+                        approval_policy=eff_ap,
+                        sandbox_mode=eff_sb,
+                        cwd=live_cwd,
+                    )
+                except CodexRpcError as e:
+                    logger.debug("thread_settings_update during adopt skipped: %s", e)
+
+            hydrated_turns = self._hydrate_adopted_thread_turns(session, clean_tid)
+            self._record_event(session, "thread/adopted", {
+                "threadId": clean_tid,
+                "hydratedTurns": hydrated_turns,
+                "permissionSource": perm_src,
+                "approvalPolicy": eff_ap,
+                "sandboxMode": eff_sb,
+            })
+            self._sync_sqlite_status(
+                target_cid,
+                "CASCADE_RUN_STATUS_RUNNING" if session["status"] == "working" else "CASCADE_RUN_STATUS_IDLE",
+                session.get("stepCount", 0),
+                session.get("lastAgentMessage") or preview or f"Adopted Codex thread {clean_tid[:12]}",
+                1 if session["status"] == "working" else 0,
+            )
+            self._save_state()
+
+            dispatch_res = None
+            if prompt and prompt.strip():
+                dispatch_res = self._dispatch_turn(session, prompt.strip())
+
+            return {
+                "action": "thread/adopt",
+                "conversationId": target_cid,
+                "threadId": clean_tid,
+                "role": session["role"],
+                "cwd": session["cwd"],
+                "model": session["model"],
+                "effort": session["effort"],
+                "permissionSource": session.get("permissionSource", perm_src),
+                "approvalPolicy": session["approvalPolicy"],
+                "sandboxMode": session["sandbox"],
+                "hydratedTurns": hydrated_turns,
+                "status": session["status"],
+                **({"dispatch": dispatch_res} if dispatch_res else {}),
+            }
+
     def configure_subagent(
         self,
         conversation_id: str,
         model: Optional[str] = None,
         effort: Optional[str] = None,
         approval_mode: Optional[str] = None,
+        permission_source: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        sandbox_mode: Optional[str] = None,
         compact: bool = False,
     ) -> Dict[str, Any]:
         with self._conversation_lock(conversation_id):
@@ -2034,15 +2449,78 @@ class UnifiedSubagentBridge:
                     raise ValueError("Invalid reasoning effort")
                 if model is not None and (not isinstance(model, str) or not model.strip()):
                     raise ValueError("Invalid model")
+                if permission_source is not None and permission_source not in ("codexConfig", "bypass", "custom"):
+                    raise ValueError("Invalid permissionSource; expected codexConfig, bypass, or custom")
+                if approval_policy is not None and approval_policy not in ("never", "on-request", "untrusted", "inherit"):
+                    raise ValueError("Invalid approvalPolicy")
+                if sandbox_mode is not None and sandbox_mode not in (
+                    "read-only", "workspace-write", "danger-full-access", "inherit"
+                ):
+                    raise ValueError("Invalid sandboxMode")
+
                 tid, turn_id = session.get("threadId"), session.get("activeTurnId")
                 if model is not None:
                     session["model"] = model
                 if effort is not None:
                     session["effort"] = effort
-                if approval_mode in ("auto_accept", "interactive"):
-                    session["approvalMode"] = approval_mode
+
+                perm_changed = any(
+                    x is not None for x in (permission_source, approval_policy, sandbox_mode, approval_mode)
+                )
+                eff_ap = session.get("approvalPolicy", "never")
+                eff_sb = session.get("sandbox", "danger-full-access")
+                if perm_changed:
+                    if approval_mode in ("auto_accept", "interactive") and not permission_source and not approval_policy:
+                        approval_policy = "never" if approval_mode == "auto_accept" else "on-request"
+                        permission_source = "custom"
+                    eff_src = permission_source or (
+                        "custom" if (approval_policy or sandbox_mode) else session.get("permissionSource", "codexConfig")
+                    )
+                    eff_src, eff_ap, eff_sb = resolve_effective_permissions(
+                        eff_src,
+                        approval_policy or session.get("approvalPolicy", "never"),
+                        sandbox_mode or session.get("sandbox", "danger-full-access"),
+                    )
+                    session["permissionSource"] = eff_src
+                    session["approvalPolicy"] = eff_ap
+                    session["sandbox"] = eff_sb
+                    session["approvalMode"] = (
+                        approval_mode
+                        if approval_mode in ("auto_accept", "interactive")
+                        else ("auto_accept" if eff_ap == "never" else "interactive")
+                    )
                 self._save_state()
-            result = {"conversationId": conversation_id, "threadId": tid}
+
+            result: Dict[str, Any] = {
+                "conversationId": conversation_id,
+                "threadId": tid,
+                "model": session.get("model"),
+                "effort": session.get("effort"),
+                "permissionSource": session.get("permissionSource", "codexConfig"),
+                "approvalPolicy": session.get("approvalPolicy"),
+                "sandboxMode": session.get("sandbox"),
+                "approvalMode": session.get("approvalMode"),
+            }
+            if tid and (perm_changed or model is not None or effort is not None):
+                try:
+                    self._ensure_thread(session)
+                    result["threadSettingsUpdate"] = self.codex.thread_settings_update(
+                        thread_id=tid,
+                        model=model,
+                        effort=effort,
+                        approval_policy=eff_ap if perm_changed else None,
+                        sandbox_mode=eff_sb if perm_changed else None,
+                        cwd=session.get("cwd"),
+                    )
+                    self._record_event(session, "thread/settings/update", {
+                        "permissionSource": session.get("permissionSource"),
+                        "approvalPolicy": eff_ap,
+                        "sandboxMode": eff_sb,
+                        "model": session.get("model"),
+                        "effort": session.get("effort"),
+                    })
+                except CodexRpcError as e:
+                    logger.debug("thread_settings_update returned: %s", e)
             if tid and turn_id and (model is not None or effort is not None):
                 try:
                     result["settingsUpdate"] = self.codex.turn_settings_update(tid, turn_id, model, effort)
@@ -2148,6 +2626,13 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                     self._send_json(400, {"error": "conversationId query parameter is required"})
                     return
                 self._send_json(200, BRIDGE_INSTANCE.inspect_subagent(conv_id))
+                return
+
+            if parsed.path == "/api/codex/threads":
+                limit = int((qs.get("limit") or ["25"])[0] or "25")
+                search = (qs.get("search") or [None])[0]
+                cwd = (qs.get("cwd") or [None])[0]
+                self._send_json(200, BRIDGE_INSTANCE.list_codex_threads(limit=limit, search_term=search, cwd=cwd))
                 return
 
             self._send_json(404, {"error": f"Unknown GET endpoint: {parsed.path}"})
@@ -2264,12 +2749,32 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 self._send_json(200, res)
                 return
 
+            if parsed.path == "/api/codex/adopt":
+                res = BRIDGE_INSTANCE.adopt_codex_thread(
+                    thread_id=body.get("threadId", ""),
+                    conversation_id=body.get("conversationId"),
+                    parent_conversation_id=body.get("parentConversationId"),
+                    role=body.get("role"),
+                    prompt=body.get("prompt"),
+                    permission_source=body.get("permissionSource"),
+                    approval_policy=body.get("approvalPolicy"),
+                    sandbox_mode=body.get("sandboxMode"),
+                    model=body.get("model"),
+                    effort=body.get("effort"),
+                    cwd=body.get("cwd"),
+                )
+                self._send_json(200, res)
+                return
+
             if parsed.path == "/api/subagent/configure":
                 res = BRIDGE_INSTANCE.configure_subagent(
                     conversation_id=body["conversationId"],
                     model=body.get("model"),
                     effort=body.get("effort"),
                     approval_mode=body.get("approvalMode"),
+                    permission_source=body.get("permissionSource"),
+                    approval_policy=body.get("approvalPolicy"),
+                    sandbox_mode=body.get("sandboxMode"),
                     compact=bool(body.get("compact", False)),
                 )
                 self._send_json(200, res)

@@ -150,7 +150,18 @@ function renderInspector(data) {
   const shortConv = (s.conversationId || '').slice(0, 14);
   const shortThread = s.threadId ? ` | thread: ${s.threadId.slice(0, 14)}` : '';
   const shortTurn = s.activeTurnId ? ` | turn: ${s.activeTurnId.slice(0, 10)}` : '';
-  el('insp-ids').textContent = `conv: ${shortConv}${shortThread}${shortTurn}`;
+  const permInfo = s.engine === 'codex'
+    ? ` | perm: ${s.permissionSource || 'codexConfig'} (${s.approvalPolicy || 'never'}/${s.sandboxMode || 'danger-full-access'})`
+    : '';
+  el('insp-ids').textContent = `conv: ${shortConv}${shortThread}${shortTurn}${permInfo}`;
+
+  if (s.engine === 'codex') {
+    if (el('cfg-model') && !el('cfg-model').matches(':focus')) el('cfg-model').value = s.model || '';
+    if (el('cfg-effort') && s.effort) el('cfg-effort').value = s.effort;
+    if (el('cfg-perm-source') && s.permissionSource) el('cfg-perm-source').value = s.permissionSource;
+    if (el('cfg-sandbox') && s.sandboxMode) el('cfg-sandbox').value = s.sandboxMode;
+    if (el('cfg-approval') && s.approvalPolicy) el('cfg-approval').value = s.approvalPolicy;
+  }
 
   // Pending approvals
   const approvals = s.pendingApprovals || [];
@@ -286,6 +297,7 @@ const profileFields = {
   model: 'profile-model',
   effort: 'profile-effort',
   executionMode: 'profile-mode',
+  permissionSource: 'profile-perm-source',
   sandboxMode: 'profile-sandbox',
   approvalPolicy: 'profile-approval',
   systemPrompt: 'profile-prompt',
@@ -436,16 +448,112 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!state.selectedId) return;
     const model = el('cfg-model').value.trim() || undefined;
     const effort = el('cfg-effort').value;
-    const approvalMode = el('cfg-approval').value;
+    const permissionSource = el('cfg-perm-source') ? el('cfg-perm-source').value : undefined;
+    const sandboxMode = el('cfg-sandbox') ? el('cfg-sandbox').value : undefined;
+    const approvalPolicy = el('cfg-approval').value;
     const res = await apiPost('/api/subagent/configure', {
       conversationId: state.selectedId,
       model,
       effort,
-      approvalMode,
+      permissionSource,
+      sandboxMode,
+      approvalPolicy,
     });
-    showFeedback(res.error ? `Error: ${res.error}` : 'Updated session settings');
+    showFeedback(
+      res.error
+        ? `Error: ${res.error}`
+        : `Updated permissions (${res.permissionSource}: ${res.approvalPolicy}/${res.sandboxMode})`
+    );
     pollAll();
   });
+
+  if (el('btn-bypass-now')) {
+    el('btn-bypass-now').addEventListener('click', async () => {
+      if (!state.selectedId) return;
+      const res = await apiPost('/api/subagent/configure', {
+        conversationId: state.selectedId,
+        permissionSource: 'bypass',
+        approvalPolicy: 'never',
+        sandboxMode: 'danger-full-access',
+      });
+      showFeedback(
+        res.error
+          ? `Error: ${res.error}`
+          : '⚡ Bypass Permissions enabled (approvalPolicy=never, sandbox=danger-full-access)'
+      );
+      pollAll();
+    });
+  }
+
+  // Adopt / Take Over Existing Codex Session Modal
+  async function loadAdoptableThreads() {
+    const sel = el('adopt-thread-select');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">Loading Codex threads from daemon…</option>';
+    try {
+      const data = await apiGet('/api/codex/threads', { limit: '30' });
+      const threads = data.threads || [];
+      sel.replaceChildren(new Option('— Select a Codex session to take over —', ''));
+      for (const t of threads) {
+        const tag = t.isLoaded ? '🟢 [LOADED]' : '⚪ [DISK]';
+        const adopted = t.isAdopted ? ' (already adopted)' : '';
+        const prev = (t.preview || t.cwd || 'No preview').replace(/\s+/g, ' ').slice(0, 56);
+        const label = `${tag} ${t.threadId.slice(0, 10)} · ${t.model || 'codex'} · ${prev}${adopted}`;
+        sel.add(new Option(label, t.threadId));
+      }
+    } catch (e) {
+      sel.replaceChildren(new Option(`Failed to load threads: ${e.message}`, ''));
+    }
+  }
+
+  if (el('btn-adopt-modal')) {
+    el('btn-adopt-modal').addEventListener('click', () => {
+      el('adopt-modal').classList.remove('hidden');
+      loadAdoptableThreads();
+    });
+  }
+  if (el('btn-close-adopt-modal')) {
+    el('btn-close-adopt-modal').addEventListener('click', () => {
+      el('adopt-modal').classList.add('hidden');
+    });
+  }
+  if (el('btn-refresh-threads')) {
+    el('btn-refresh-threads').addEventListener('click', loadAdoptableThreads);
+  }
+  if (el('adopt-thread-select')) {
+    el('adopt-thread-select').addEventListener('change', (e) => {
+      if (e.target.value) {
+        el('adopt-thread-id').value = e.target.value;
+      }
+    });
+  }
+  if (el('btn-confirm-adopt')) {
+    el('btn-confirm-adopt').addEventListener('click', async () => {
+      const threadId = (el('adopt-thread-id').value || el('adopt-thread-select').value || '').trim();
+      if (!threadId) {
+        showFeedback('Please select or enter a Codex Thread ID to take over', true);
+        return;
+      }
+      const permissionSource = el('adopt-perm-source').value;
+      const role = el('adopt-role').value.trim() || undefined;
+      const prompt = el('adopt-prompt').value.trim() || undefined;
+      el('adopt-modal').classList.add('hidden');
+      showFeedback(`Taking over Codex session ${threadId.slice(0, 12)}…`);
+      const res = await apiPost('/api/codex/adopt', {
+        threadId,
+        permissionSource,
+        role,
+        prompt,
+      });
+      if (res.error) {
+        showFeedback(`Adopt failed: ${res.error}`, true);
+      } else {
+        state.selectedId = res.conversationId;
+        showFeedback(`Took over Codex thread ${threadId.slice(0, 10)} (${res.hydratedTurns || 0} turns imported)`);
+      }
+      await pollAll();
+    });
+  }
 
   el('btn-compact-thread').addEventListener('click', async () => {
     if (!state.selectedId) return;

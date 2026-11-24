@@ -19,3 +19,8 @@ The `codex-subagent` plugin connects Antigravity (`agy`) directly to the local *
 When a Codex subagent reaches a design fork after Turn 1:
 1. Call `subagent_fork(conversationId=<codex_id>, newRole="Codex Approach B", prompt="Try lockless ring buffer approach")`.
 2. Compare the diffs of both branches using `subagent_inspect` and revert or kill the losing branch.
+
+### Workflow 3: Taking Over Existing Standalone Codex Sessions & Managing Permissions
+1. Call `subagent_list_codex_sessions(limit=25)` to discover all loaded in-memory threads and recent persisted sessions in `codex app-server`.
+2. Call `subagent_adopt_codex_session(threadId=<tid>, permissionSource="codexConfig" | "bypass", prompt="...")` (or press `t` in the `tmux` Split-View TUI, click **📥 Take Over Session** in the Web Sidecar UI, or pass `[ADOPT:<threadId>]` in `invoke_subagent`/`send_message`).
+3. To adjust permissions at any time, use `subagent_configure(conversationId=<codex_id>, permissionSource="bypass")` (for `approvalPolicy="never"` + `sandboxMode="danger-full-access"`), `permissionSource="codexConfig"` (inherits directly from `~/.codex/config.toml`), or `permissionSource="custom"` with explicit `approvalPolicy` and `sandboxMode` (or press `P` in the TUI / click **⚡ One-Click Bypass Permissions** in the Web UI).

@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from codex_profiles import APPROVAL_POLICIES, EFFORTS, EXECUTION_MODES, SANDBOX_MODES
+from codex_profiles import APPROVAL_POLICIES, EFFORTS, EXECUTION_MODES, PERMISSION_SOURCES, SANDBOX_MODES
 from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running
 
 
@@ -77,6 +77,15 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                 "effort": {"type": "string", "enum": EFFORTS},
                 "systemPrompt": {"type": "string"},
                 "executionMode": {"type": "string", "enum": EXECUTION_MODES},
+                "permissionSource": {
+                    "type": "string",
+                    "enum": PERMISSION_SOURCES,
+                    "description": (
+                        "'codexConfig' (default): inherit approval_policy & sandbox_mode from ~/.codex/config.toml. "
+                        "'bypass': full autonomous bypass (approvalPolicy='never', sandboxMode='danger-full-access'). "
+                        "'custom': use explicit sandboxMode and approvalPolicy."
+                    ),
+                },
                 "sandboxMode": {"type": "string", "enum": SANDBOX_MODES},
                 "approvalPolicy": {"type": "string", "enum": APPROVAL_POLICIES},
             },
@@ -84,8 +93,80 @@ MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "subagent_list_profiles",
-        "description": "List saved Codex profiles and defaults for new profiles.",
+        "description": "List saved Codex profiles and defaults for new profiles (including ~/.codex/config.toml permissions).",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "subagent_list_codex_sessions",
+        "description": (
+            "List existing Codex sessions/threads from the running `codex app-server` daemon "
+            "(both currently loaded in-memory threads and recent persisted threads on disk) "
+            "that can be directly taken over / adopted via `subagent_adopt_codex_session`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of Codex threads to list (default 25).",
+                },
+                "search": {
+                    "type": "string",
+                    "description": "Optional search keyword to filter threads.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory filter.",
+                },
+            },
+        },
+    },
+    {
+        "name": "subagent_adopt_codex_session",
+        "description": (
+            "Directly take over / adopt an existing Codex session (`threadId`) into Antigravity's "
+            "Unified Subagent Control Plane. Subscribes to live notifications via `thread/resume`, "
+            "imports historical turns into `transcript.jsonl`, optionally applies permission overrides "
+            "(`permissionSource`: 'codexConfig' | 'bypass' | 'custom'), and optionally sends an "
+            "immediate steering or follow-up `prompt`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["threadId"],
+            "properties": {
+                "threadId": {
+                    "type": "string",
+                    "description": "Existing Codex threadId to take over (from `subagent_list_codex_sessions`).",
+                },
+                "conversationId": {
+                    "type": "string",
+                    "description": "Optional custom subagent conversationId to bind this thread to.",
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Optional role title for the adopted Codex session.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Optional immediate steering (`turn/steer`) or follow-up (`turn/start`) instruction.",
+                },
+                "permissionSource": {
+                    "type": "string",
+                    "enum": PERMISSION_SOURCES,
+                    "description": "'codexConfig' (from ~/.codex/config.toml), 'bypass' (never + danger-full-access), or 'custom'.",
+                },
+                "approvalPolicy": {
+                    "type": "string",
+                    "enum": APPROVAL_POLICIES,
+                    "description": "Approval policy override when permissionSource='custom'.",
+                },
+                "sandboxMode": {
+                    "type": "string",
+                    "enum": SANDBOX_MODES,
+                    "description": "Sandbox policy override when permissionSource='custom'.",
+                },
+            },
+        },
     },
     {
         "name": "subagent_list",
@@ -239,8 +320,10 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         "name": "subagent_configure",
         "description": (
             "Dynamically update a Codex subagent's model, reasoning effort (`low`, `medium`, `high`, "
-            "`xhigh`, `ultra`), or approval mode (`auto_accept` vs `interactive`) mid-session via "
-            "`turn/settings/update`, or trigger context compaction via `thread/compact/start`."
+            "`xhigh`, `ultra`), or permissions (`permissionSource`: 'codexConfig' from ~/.codex/config.toml, "
+            "'bypass' for never + danger-full-access, or 'custom' with explicit `approvalPolicy` and `sandboxMode`) "
+            "live mid-session via `thread/settings/update` and `turn/settings/update`, or trigger context "
+            "compaction via `thread/compact/start`."
         ),
         "inputSchema": {
             "type": "object",
@@ -251,12 +334,31 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model override (e.g., 'gpt-5.4', 'o3', 'codex-mini-latest').",
+                    "description": "Optional model override (e.g., 'gpt-6.2-sol', 'gpt-5.4', 'o3').",
                 },
                 "effort": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh", "ultra"],
                     "description": "Optional reasoning effort override.",
+                },
+                "permissionSource": {
+                    "type": "string",
+                    "enum": PERMISSION_SOURCES,
+                    "description": (
+                        "'codexConfig': inherit approval_policy & sandbox_mode from ~/.codex/config.toml. "
+                        "'bypass': bypass all permission prompts and sandbox restrictions (never + danger-full-access). "
+                        "'custom': use explicit approvalPolicy and sandboxMode."
+                    ),
+                },
+                "approvalPolicy": {
+                    "type": "string",
+                    "enum": APPROVAL_POLICIES,
+                    "description": "Optional approval policy ('never', 'on-request', 'untrusted', 'inherit').",
+                },
+                "sandboxMode": {
+                    "type": "string",
+                    "enum": SANDBOX_MODES,
+                    "description": "Optional sandbox mode ('danger-full-access', 'workspace-write', 'read-only', 'inherit').",
                 },
                 "approvalMode": {
                     "type": "string",
@@ -310,6 +412,29 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Any:
         return bridge_post("/api/profiles/define", args)
     if name == "subagent_list_profiles":
         return bridge_get("/api/profiles")
+    if name == "subagent_list_codex_sessions":
+        return bridge_get(
+            "/api/codex/threads",
+            {
+                "limit": str(args.get("limit", 25)),
+                "search": args.get("search"),
+                "cwd": args.get("cwd"),
+            },
+        )
+    if name == "subagent_adopt_codex_session":
+        return bridge_post(
+            "/api/codex/adopt",
+            {
+                "threadId": args["threadId"],
+                "conversationId": args.get("conversationId"),
+                "parentConversationId": os.environ.get("ANTIGRAVITY_CONVERSATION_ID", ""),
+                "role": args.get("role"),
+                "prompt": args.get("prompt"),
+                "permissionSource": args.get("permissionSource"),
+                "approvalPolicy": args.get("approvalPolicy"),
+                "sandboxMode": args.get("sandboxMode"),
+            },
+        )
     if name == "subagent_list":
         return bridge_get(
             "/api/subagents",
@@ -363,6 +488,9 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Any:
                 "conversationId": args["conversationId"],
                 "model": args.get("model"),
                 "effort": args.get("effort"),
+                "permissionSource": args.get("permissionSource"),
+                "approvalPolicy": args.get("approvalPolicy"),
+                "sandboxMode": args.get("sandboxMode"),
                 "approvalMode": args.get("approvalMode"),
                 "compact": bool(args.get("compact", False)),
             },

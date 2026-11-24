@@ -18,6 +18,7 @@
         </div>
         <div class="mc-badges">
           <span id="daemon-badge" class="badge badge-dim">Codex Daemon: connecting…</span>
+          <button id="btn-adopt-modal" class="btn btn-xs" title="Take over an existing standalone Codex session">📥 Take Over Session</button>
           <button id="btn-spawn-modal" class="btn btn-xs btn-primary" title="Spawn a new Codex Subagent directly">+ New Codex</button>
         </div>
       </div>
@@ -139,12 +140,30 @@
               <select id="profile-mode"><option>preInvocation</option><option>sdkExecutor</option></select>
             </div>
             <div class="form-row">
+              <label for="profile-perm-source">Permission source</label>
+              <select id="profile-perm-source">
+                <option value="codexConfig">codexConfig (Use ~/.codex/config.toml)</option>
+                <option value="bypass">bypass (Full Bypass: never + danger-full-access)</option>
+                <option value="custom">custom (Explicit Sandbox & Approval below)</option>
+              </select>
+            </div>
+            <div class="form-row">
               <label for="profile-sandbox">Sandbox</label>
-              <select id="profile-sandbox"><option>read-only</option><option>workspace-write</option><option>danger-full-access</option></select>
+              <select id="profile-sandbox">
+                <option value="inherit">inherit (from ~/.codex/config.toml)</option>
+                <option value="danger-full-access">danger-full-access</option>
+                <option value="workspace-write">workspace-write</option>
+                <option value="read-only">read-only</option>
+              </select>
             </div>
             <div class="form-row">
               <label for="profile-approval">Approval policy</label>
-              <select id="profile-approval"><option>never</option><option>on-request</option><option>untrusted</option></select>
+              <select id="profile-approval">
+                <option value="inherit">inherit (from ~/.codex/config.toml)</option>
+                <option value="never">never (Bypass Approval)</option>
+                <option value="on-request">on-request</option>
+                <option value="untrusted">untrusted</option>
+              </select>
             </div>
             <div class="form-row">
               <label for="profile-prompt">System instructions</label>
@@ -159,30 +178,50 @@
         </section>
 
         <div class="panel-section session-controls hidden">
-          <h4>⚙️ Live Session Settings (<code>turn/settings/update</code>)</h4>
+          <h4>⚙️ Live Session & Permission Settings (<code>thread/settings/update</code>)</h4>
           <div class="form-row">
             <label>Model</label>
-            <input type="text" id="cfg-model" placeholder="e.g. gpt-5.4, o3, codex-mini-latest" />
+            <input type="text" id="cfg-model" placeholder="e.g. gpt-6.2-sol, gpt-5.4, o3" />
           </div>
           <div class="form-row">
             <label>Reasoning Effort</label>
             <select id="cfg-effort">
               <option value="low">low</option>
               <option value="medium">medium</option>
-              <option value="high" selected>high</option>
-              <option value="xhigh">xhigh</option>
+              <option value="high">high</option>
+              <option value="xhigh" selected>xhigh</option>
               <option value="ultra">ultra</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Permission Mode</label>
+            <select id="cfg-perm-source">
+              <option value="codexConfig">Inherit ~/.codex/config.toml (Default)</option>
+              <option value="bypass">Bypass All Permissions (never + danger-full-access)</option>
+              <option value="custom">Custom Sandbox & Approval Policy</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Sandbox Mode</label>
+            <select id="cfg-sandbox">
+              <option value="danger-full-access">danger-full-access (Unrestricted)</option>
+              <option value="workspace-write">workspace-write</option>
+              <option value="read-only">read-only</option>
+              <option value="inherit">inherit (~/.codex/config.toml)</option>
             </select>
           </div>
           <div class="form-row">
             <label>Approval Policy</label>
             <select id="cfg-approval">
-              <option value="auto_accept">Auto-Accept (Autonomous Subagent)</option>
-              <option value="interactive">Interactive (Prompt in Mission Control UI)</option>
+              <option value="never">never (Auto-Accept / Zero Prompts)</option>
+              <option value="on-request">on-request (Interactive in UI)</option>
+              <option value="untrusted">untrusted</option>
+              <option value="inherit">inherit (~/.codex/config.toml)</option>
             </select>
           </div>
           <div class="btn-row">
             <button id="btn-apply-cfg" class="btn btn-xs btn-primary">Apply Settings</button>
+            <button id="btn-bypass-now" class="btn btn-xs btn-success" title="Immediately set approvalPolicy=never & sandbox=danger-full-access">⚡ One-Click Bypass Permissions</button>
             <button id="btn-compact-thread" class="btn btn-xs">🗜 Compact Context</button>
           </div>
         </div>
@@ -259,6 +298,46 @@
         </div>
         <div class="btn-row">
           <button id="btn-confirm-spawn" class="btn btn-primary">Launch Codex Subagent</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Adopt Existing Codex Session Modal -->
+    <div id="adopt-modal" class="modal-backdrop hidden">
+      <div class="modal-card">
+        <div class="modal-header">
+          <strong>📥 Take Over / Adopt Existing Codex Session</strong>
+          <button id="btn-close-adopt-modal" class="btn btn-xs">✕</button>
+        </div>
+        <div class="form-row">
+          <label>Select Existing Daemon Thread (Loaded & Recent)</label>
+          <select id="adopt-thread-select">
+            <option value="">Loading Codex sessions from daemon…</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Or Enter Codex Thread ID Manually</label>
+          <input type="text" id="adopt-thread-id" placeholder="e.g. 019d8f3c-..." />
+        </div>
+        <div class="form-row">
+          <label>Permission Mode</label>
+          <select id="adopt-perm-source">
+            <option value="codexConfig">Use ~/.codex/config.toml (Default)</option>
+            <option value="bypass">Bypass All Permissions (never + danger-full-access)</option>
+            <option value="custom">Keep Thread Default</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Role Title (Optional)</label>
+          <input type="text" id="adopt-role" placeholder="Auto-filled from thread preview if blank" />
+        </div>
+        <div class="form-row">
+          <label>Immediate Steer / Follow-up Prompt (Optional)</label>
+          <textarea id="adopt-prompt" rows="2" placeholder="Leave empty to attach & inspect first, or enter an immediate instruction…"></textarea>
+        </div>
+        <div class="btn-row">
+          <button id="btn-refresh-threads" class="btn btn-xs" type="button">🔄 Refresh Threads</button>
+          <button id="btn-confirm-adopt" class="btn btn-primary" type="button">Take Over Codex Session</button>
         </div>
       </div>
     </div>

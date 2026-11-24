@@ -1,0 +1,449 @@
+/**
+ * Unified Subagent Mission Control Frontend (`app.js`).
+ * Drives live inspection, mid-turn steering (`turn/steer` & `SendAgentMessage`),
+ * unified diff viewing, plan checklists, and cross-engine handoff for both
+ * OpenAI Codex and native Gemini subagents.
+ */
+
+const state = {
+  subagents: [],
+  selectedId: null,
+  activeRootConvId: '',
+  currentOnly: false,
+  activeTab: 'stream',
+  inspected: null,
+};
+
+const el = (id) => document.getElementById(id);
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function showFeedback(text, isError = false) {
+  const fb = el('steer-feedback');
+  if (!fb) return;
+  fb.textContent = text;
+  fb.style.color = isError ? '#f87171' : '#34d399';
+  setTimeout(() => {
+    if (fb.textContent === text) fb.textContent = '';
+  }, 4000);
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  const res = await fetch(qs ? `${path}?${qs}` : path);
+  return await res.json();
+}
+
+async function apiPost(path, body = {}) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return await res.json();
+}
+
+function renderRoster() {
+  const container = el('roster-list');
+  const filtered = state.currentOnly && state.activeRootConvId
+    ? state.subagents.filter((s) => s.matchesActiveConversation)
+    : state.subagents;
+
+  el('roster-count').textContent = `${filtered.length} subagent${filtered.length === 1 ? '' : 's'}`;
+
+  if (!filtered.length) {
+    container.innerHTML = `<div class="mc-empty">No subagents found${state.currentOnly ? ' for current conversation' : ''}. Invoke <code>codex</code>, <code>self</code>, or <code>research</code>, or click <b>+ New Codex</b>.</div>`;
+    return;
+  }
+
+  if (!state.selectedId || !filtered.some((s) => s.conversationId === state.selectedId)) {
+    state.selectedId = filtered[0].conversationId;
+  }
+
+  container.innerHTML = filtered
+    .map((s) => {
+      const isSelected = s.conversationId === state.selectedId;
+      const engineClass = s.engine === 'codex' ? 'engine-codex' : 'engine-gemini';
+      const engineLabel = s.engine === 'codex' ? `CODEX · ${s.effort || 'high'}` : `GEMINI · ${s.agentName || 'sub'}`;
+      const statusClass = `status-${s.status || 'idle'}`;
+      const activity = s.activity || (s.status === 'working' ? 'Working…' : 'Idle');
+      return `
+        <div class="roster-card ${isSelected ? 'selected' : ''}" data-conv-id="${escapeHtml(s.conversationId)}">
+          <div class="roster-top">
+            <div class="roster-left">
+              <span class="engine-pill ${engineClass}">${escapeHtml(engineLabel)}</span>
+              <span class="roster-role">${escapeHtml(s.role || s.conversationId.slice(0, 12))}</span>
+            </div>
+            <span class="status-pill ${statusClass}">${escapeHtml(s.status || 'idle')}</span>
+          </div>
+          <div class="roster-bottom">
+            <span class="roster-activity">${escapeHtml(activity)}</span>
+            <span>${Number(s.steps || 0)} steps</span>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+
+  for (const card of container.querySelectorAll('.roster-card')) {
+    card.addEventListener('click', () => {
+      state.selectedId = card.getAttribute('data-conv-id');
+      renderRoster();
+      pollInspect();
+    });
+  }
+}
+
+function formatUnifiedDiff(diffText) {
+  if (!diffText || !diffText.trim()) {
+    return 'No unified diff recorded yet for this subagent.';
+  }
+  return diffText
+    .split('\n')
+    .map((line) => {
+      const esc = escapeHtml(line);
+      if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@') || line.startsWith('diff --git')) {
+        return `<span class="diff-hdr">${esc}</span>`;
+      }
+      if (line.startsWith('+')) {
+        return `<span class="diff-add">${esc}</span>`;
+      }
+      if (line.startsWith('-')) {
+        return `<span class="diff-del">${esc}</span>`;
+      }
+      return esc;
+    })
+    .join('\n');
+}
+
+function renderInspector(data) {
+  const pane = el('inspector-pane');
+  if (!data || !data.summary) {
+    pane.classList.add('hidden');
+    return;
+  }
+  pane.classList.remove('hidden');
+
+  const s = data.summary;
+  const tr = data.transcript || {};
+
+  const engineBadge = el('insp-engine-badge');
+  engineBadge.textContent = s.engine === 'codex' ? `CODEX (${s.model || 'daemon'})` : `GEMINI (${s.agentName || 'native'})`;
+  engineBadge.className = `engine-pill ${s.engine === 'codex' ? 'engine-codex' : 'engine-gemini'}`;
+
+  el('insp-role').textContent = s.role || s.conversationId;
+  const stPill = el('insp-status-pill');
+  stPill.textContent = s.status || 'idle';
+  stPill.className = `status-pill status-${s.status || 'idle'}`;
+
+  const shortConv = (s.conversationId || '').slice(0, 14);
+  const shortThread = s.threadId ? ` | thread: ${s.threadId.slice(0, 14)}` : '';
+  const shortTurn = s.activeTurnId ? ` | turn: ${s.activeTurnId.slice(0, 10)}` : '';
+  el('insp-ids').textContent = `conv: ${shortConv}${shortThread}${shortTurn}`;
+
+  // Pending approvals
+  const approvals = s.pendingApprovals || [];
+  const banner = el('approval-banner');
+  if (approvals.length > 0) {
+    banner.classList.remove('hidden');
+    const first = approvals[0];
+    el('approval-desc').textContent = `${first.method}: ${JSON.stringify(first.params || {}).slice(0, 120)}`;
+  } else {
+    banner.classList.add('hidden');
+  }
+
+  // Live Thinking
+  const thinkingBox = el('live-thinking-box');
+  const thinkingText = s.lastThinking || tr.lastThinking || '';
+  if (thinkingText) {
+    thinkingBox.classList.remove('hidden');
+    el('live-thinking-content').textContent = thinkingText;
+  } else {
+    thinkingBox.classList.add('hidden');
+  }
+
+  // Steps stream
+  const steps = (tr.recentSteps || []).slice().reverse();
+  const stepsContainer = el('steps-container');
+  if (!steps.length) {
+    stepsContainer.innerHTML = `<div class="mc-empty">No steps recorded in transcript.jsonl yet.</div>`;
+  } else {
+    stepsContainer.innerHTML = steps
+      .map((st) => {
+        const toolsHtml = (st.tools || [])
+          .map((t) => `<span class="tool-chip">${escapeHtml(t)}</span>`)
+          .join('');
+        const bodyText = st.response || st.content || st.thinking || '';
+        return `
+          <div class="step-card">
+            <div class="step-card-header">
+              <span><b>#${st.stepIndex}</b> · ${escapeHtml(st.type)} (${escapeHtml(st.status)})</span>
+              <button class="btn btn-xs btn-revert-step" data-step="${st.stepIndex}" title="Revert to this step">Revert here</button>
+            </div>
+            ${toolsHtml ? `<div class="step-tools">${toolsHtml}</div>` : ''}
+            ${bodyText ? `<div class="step-body">${escapeHtml(bodyText)}</div>` : ''}
+          </div>
+        `;
+      })
+      .join('');
+
+    for (const btn of stepsContainer.querySelectorAll('.btn-revert-step')) {
+      btn.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const stepIdx = Number(btn.getAttribute('data-step') || 1);
+        const res = await apiPost('/api/subagent/revert', {
+          conversationId: state.selectedId,
+          stepOrTurns: s.engine === 'codex' ? 1 : stepIdx,
+        });
+        showFeedback(res.error ? `Revert failed: ${res.error}` : `Reverted (${res.action})`);
+        pollAll();
+      });
+    }
+  }
+
+  // Live Diff tab
+  el('diff-container').innerHTML = formatUnifiedDiff(data.diff || '');
+
+  // Plan & Events tab
+  el('plan-explanation').textContent = data.planExplanation || '';
+  const planList = el('plan-list');
+  const plan = data.plan || [];
+  if (!plan.length) {
+    planList.innerHTML = `<li class="mono-dim">No active plan steps reported yet.</li>`;
+  } else {
+    planList.innerHTML = plan
+      .map((p) => {
+        const icon = p.status === 'completed' ? '✅' : p.status === 'in_progress' ? '🔄' : '⬜';
+        return `<li class="plan-item"><span>${icon}</span><span>${escapeHtml(p.step)}</span></li>`;
+      })
+      .join('');
+  }
+
+  const eventsList = el('events-list');
+  const events = (data.events || []).slice().reverse();
+  eventsList.innerHTML = events.length
+    ? events
+        .map(
+          (ev) =>
+            `<div><span class="mono-dim">${escapeHtml((ev.timestamp || '').slice(11, 19))}</span> <b>${escapeHtml(ev.type)}</b> ${escapeHtml(JSON.stringify(ev).slice(0, 110))}</div>`
+        )
+        .join('')
+    : `<div class="mono-dim">No daemon events yet.</div>`;
+}
+
+async function pollInspect() {
+  if (!state.selectedId) return;
+  try {
+    const data = await apiGet('/api/subagent/inspect', { conversationId: state.selectedId });
+    state.inspected = data;
+    renderInspector(data);
+  } catch (e) {
+    console.warn('pollInspect error:', e);
+  }
+}
+
+async function pollAll() {
+  try {
+    const res = await apiGet('/api/mission-control', { all: 'true' });
+    state.subagents = res.subagents || [];
+    state.activeRootConvId = res.activeRootConversationId || '';
+
+    const badge = el('daemon-badge');
+    if (res.codexDaemonConnected) {
+      badge.textContent = 'Codex Daemon: Live (.sock)';
+      badge.className = 'badge badge-ok';
+    } else {
+      badge.textContent = 'Codex Daemon: Standby';
+      badge.className = 'badge badge-dim';
+    }
+
+    renderRoster();
+    if (state.selectedId) {
+      await pollInspect();
+    }
+  } catch (e) {
+    console.warn('pollAll error:', e);
+  }
+}
+
+// Event Listeners
+document.addEventListener('DOMContentLoaded', () => {
+  // Filter toggle
+  el('chk-current-only').addEventListener('change', (e) => {
+    state.currentOnly = e.target.checked;
+    renderRoster();
+  });
+
+  // Tabs
+  for (const btn of document.querySelectorAll('.tab-btn')) {
+    btn.addEventListener('click', () => {
+      for (const b of document.querySelectorAll('.tab-btn')) b.classList.remove('active');
+      for (const p of document.querySelectorAll('.tab-panel')) p.classList.add('hidden');
+      btn.classList.add('active');
+      const tab = btn.getAttribute('data-tab');
+      state.activeTab = tab;
+      el(`tab-${tab}`).classList.remove('hidden');
+    });
+  }
+
+  // Steer send
+  async function sendSteer() {
+    if (!state.selectedId) return;
+    const input = el('steer-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+    const mode = el('steer-mode').value;
+    input.value = '';
+    showFeedback('Sending steer instruction…');
+    const res = await apiPost('/api/subagent/steer', {
+      conversationId: state.selectedId,
+      message: msg,
+      mode,
+    });
+    if (res.error) {
+      showFeedback(`Error: ${res.error}`, true);
+    } else {
+      showFeedback(`Applied (${res.action || mode})`);
+    }
+    await pollAll();
+  }
+
+  el('btn-send-steer').addEventListener('click', sendSteer);
+  el('steer-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendSteer();
+    }
+  });
+
+  // Quick actions: Interrupt / Revert / Kill
+  el('btn-interrupt').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    const res = await apiPost('/api/subagent/interrupt', { conversationId: state.selectedId });
+    showFeedback(res.error ? `Error: ${res.error}` : `Interrupted (${res.action})`);
+    pollAll();
+  });
+
+  el('btn-revert-last').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    const res = await apiPost('/api/subagent/revert', { conversationId: state.selectedId, stepOrTurns: 1 });
+    showFeedback(res.error ? `Error: ${res.error}` : `Reverted (${res.action})`);
+    pollAll();
+  });
+
+  el('btn-kill').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    const res = await apiPost('/api/subagent/kill', { conversationId: state.selectedId });
+    showFeedback(res.error ? `Error: ${res.error}` : 'Subagent terminated');
+    pollAll();
+  });
+
+  // Approvals
+  el('btn-approve-accept').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    await apiPost('/api/subagent/approve', { conversationId: state.selectedId, decision: 'accept' });
+    showFeedback('Approved request');
+    pollAll();
+  });
+
+  el('btn-approve-decline').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    await apiPost('/api/subagent/approve', { conversationId: state.selectedId, decision: 'decline' });
+    showFeedback('Declined request');
+    pollAll();
+  });
+
+  // Config & Compaction
+  el('btn-apply-cfg').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    const model = el('cfg-model').value.trim() || undefined;
+    const effort = el('cfg-effort').value;
+    const approvalMode = el('cfg-approval').value;
+    const res = await apiPost('/api/subagent/configure', {
+      conversationId: state.selectedId,
+      model,
+      effort,
+      approvalMode,
+    });
+    showFeedback(res.error ? `Error: ${res.error}` : 'Updated session settings');
+    pollAll();
+  });
+
+  el('btn-compact-thread').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    const res = await apiPost('/api/subagent/configure', {
+      conversationId: state.selectedId,
+      compact: true,
+    });
+    showFeedback(res.error ? `Error: ${res.error}` : 'Triggered thread/compact/start');
+  });
+
+  // Fork & Handoff
+  el('btn-run-handoff').addEventListener('click', async () => {
+    if (!state.selectedId) return;
+    const target = el('handoff-target').value;
+    const newRole = el('handoff-role').value.trim() || undefined;
+    const prompt = el('handoff-prompt').value.trim() || undefined;
+
+    let res;
+    if (target === 'fork') {
+      res = await apiPost('/api/subagent/fork', {
+        conversationId: state.selectedId,
+        newRole,
+        prompt,
+      });
+    } else {
+      res = await apiPost('/api/subagent/handoff', {
+        sourceConversationId: state.selectedId,
+        targetEngine: target,
+        newRole,
+        prompt: prompt || 'Continue from the previous subagent findings.',
+      });
+    }
+    if (res.error) {
+      showFeedback(`Error: ${res.error}`, true);
+    } else {
+      showFeedback(`Executed ${res.action}`);
+      if (res.newConversationId) {
+        state.selectedId = res.newConversationId;
+      }
+    }
+    pollAll();
+  });
+
+  // Spawn Codex modal
+  el('btn-spawn-modal').addEventListener('click', () => {
+    el('spawn-modal').classList.remove('hidden');
+  });
+  el('btn-close-modal').addEventListener('click', () => {
+    el('spawn-modal').classList.add('hidden');
+  });
+  el('btn-confirm-spawn').addEventListener('click', async () => {
+    const role = el('spawn-role').value.trim() || 'Codex Specialist';
+    const cwd = el('spawn-cwd').value.trim();
+    const effort = el('spawn-effort').value;
+    const prompt = el('spawn-prompt').value.trim();
+    if (!prompt) return;
+    el('spawn-modal').classList.add('hidden');
+    const res = await apiPost('/api/subagent/spawn-codex', {
+      role,
+      cwd,
+      effort,
+      prompt,
+    });
+    if (res.conversationId) {
+      state.selectedId = res.conversationId;
+      showFeedback(`Spawned Codex thread ${res.threadId || ''}`);
+    }
+    pollAll();
+  });
+
+  pollAll();
+  setInterval(pollAll, 2000);
+});

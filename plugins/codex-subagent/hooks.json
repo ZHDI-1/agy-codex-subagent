@@ -1,0 +1,12 @@
+{
+  "codex-subagent-interceptor": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 /home/zhdi/build_part/agy_subagent/plugins/codex-subagent/bin/codex_hook_intercept.py",
+        "timeout": 25
+      }
+    ]
+  }
+}

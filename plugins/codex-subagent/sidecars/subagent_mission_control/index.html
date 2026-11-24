@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Unified Subagent Mission Control</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="/preload.js" onerror="void 0"></script>
+</head>
+<body>
+  <div class="mc-shell">
+    <!-- Top Header & Daemon Status -->
+    <header class="mc-header">
+      <div class="mc-title-row">
+        <div class="mc-brand">
+          <span class="mc-logo-dot"></span>
+          <span class="mc-title">Subagent Mission Control</span>
+        </div>
+        <div class="mc-badges">
+          <span id="daemon-badge" class="badge badge-dim">Codex Daemon: connecting…</span>
+          <button id="btn-spawn-modal" class="btn btn-xs btn-primary" title="Spawn a new Codex Subagent directly">+ New Codex</button>
+        </div>
+      </div>
+      <div class="mc-filter-row">
+        <label class="filter-toggle">
+          <input type="checkbox" id="chk-current-only" />
+          <span>Current conversation only</span>
+        </label>
+        <span id="roster-count" class="mc-count">0 subagents</span>
+      </div>
+    </header>
+
+    <!-- Subagent Roster List (Unified Gemini + Codex Tree) -->
+    <section id="roster-list" class="mc-roster">
+      <div class="mc-empty">No subagents discovered yet. Invoke <code>codex</code>, <code>self</code>, or <code>research</code>, or click <b>+ New Codex</b>.</div>
+    </section>
+
+    <!-- Active Subagent Inspector -->
+    <main id="inspector-pane" class="mc-inspector hidden">
+      <div class="inspector-header">
+        <div class="inspector-meta">
+          <div class="inspector-title-line">
+            <span id="insp-engine-badge" class="engine-pill">CODEX</span>
+            <strong id="insp-role">Subagent Role</strong>
+            <span id="insp-status-pill" class="status-pill">idle</span>
+          </div>
+          <div class="inspector-sub-line">
+            <span id="insp-ids" class="mono-dim">conv: — | thread: —</span>
+          </div>
+        </div>
+        <div class="inspector-quick-actions">
+          <button id="btn-interrupt" class="btn btn-xs btn-warn" title="Interrupt active turn/step without killing session">⏸ Interrupt</button>
+          <button id="btn-revert-last" class="btn btn-xs" title="Revert last turn / step">⏪ Revert</button>
+          <button id="btn-kill" class="btn btn-xs btn-danger" title="Terminate subagent permanently">⏹ Kill</button>
+        </div>
+      </div>
+
+      <!-- Pending Approvals Banner -->
+      <div id="approval-banner" class="approval-banner hidden">
+        <div class="approval-text">
+          <strong>⚠️ Approval Requested</strong>
+          <span id="approval-desc">Command or file change requires confirmation.</span>
+        </div>
+        <div class="approval-btns">
+          <button id="btn-approve-accept" class="btn btn-xs btn-success">✓ Approve</button>
+          <button id="btn-approve-decline" class="btn btn-xs btn-danger">✕ Decline</button>
+        </div>
+      </div>
+
+      <!-- 4 Inspector Tabs -->
+      <nav class="mc-tabs">
+        <button class="tab-btn active" data-tab="stream">Stream & Steps</button>
+        <button class="tab-btn" data-tab="diff">Live Diff</button>
+        <button class="tab-btn" data-tab="plan">Plan & Events</button>
+        <button class="tab-btn" data-tab="handoff">Handoff & Config</button>
+      </nav>
+
+      <!-- Tab 1: Stream & Steps -->
+      <div id="tab-stream" class="tab-panel active">
+        <div id="live-thinking-box" class="live-box hidden">
+          <div class="live-box-label">🧠 Live Reasoning / Thinking</div>
+          <pre id="live-thinking-content" class="live-pre"></pre>
+        </div>
+        <div id="steps-container" class="steps-list"></div>
+      </div>
+
+      <!-- Tab 2: Live Diff -->
+      <div id="tab-diff" class="tab-panel hidden">
+        <div id="diff-container" class="diff-viewer">No unified diff recorded yet for this subagent.</div>
+      </div>
+
+      <!-- Tab 3: Plan & Events -->
+      <div id="tab-plan" class="tab-panel hidden">
+        <div class="panel-section">
+          <h4>📋 Execution Plan Checklist (<code>turn/plan/updated</code>)</h4>
+          <div id="plan-explanation" class="plan-explanation"></div>
+          <ul id="plan-list" class="plan-checklist"></ul>
+        </div>
+        <div class="panel-section">
+          <h4>⚡ Daemon RPC Event Log</h4>
+          <div id="events-list" class="events-list"></div>
+        </div>
+      </div>
+
+      <!-- Tab 4: Cross-Engine Handoff, Fork & Dynamic Config -->
+      <div id="tab-handoff" class="tab-panel hidden">
+        <div class="panel-section">
+          <h4>⚙️ Live Session Settings (<code>turn/settings/update</code>)</h4>
+          <div class="form-row">
+            <label>Model</label>
+            <input type="text" id="cfg-model" placeholder="e.g. gpt-5.4, o3, codex-mini-latest" />
+          </div>
+          <div class="form-row">
+            <label>Reasoning Effort</label>
+            <select id="cfg-effort">
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high" selected>high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="ultra">ultra</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Approval Policy</label>
+            <select id="cfg-approval">
+              <option value="auto_accept">Auto-Accept (Autonomous Subagent)</option>
+              <option value="interactive">Interactive (Prompt in Mission Control UI)</option>
+            </select>
+          </div>
+          <div class="btn-row">
+            <button id="btn-apply-cfg" class="btn btn-xs btn-primary">Apply Settings</button>
+            <button id="btn-compact-thread" class="btn btn-xs">🗜 Compact Context</button>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <h4>🔀 Thread Fork & Cross-Engine Handoff (Gemini ⇄ Codex)</h4>
+          <p class="help-text">Fork this subagent's thread or hand off its latest findings & workspace to another engine.</p>
+          <div class="form-row">
+            <label>Target Action</label>
+            <select id="handoff-target">
+              <option value="fork">Fork current thread (thread/fork)</option>
+              <option value="codex">Hand off findings to a new Codex Subagent</option>
+              <option value="gemini">Hand off findings back to Parent Gemini Agent</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>New Role Name</label>
+            <input type="text" id="handoff-role" placeholder="e.g. Codex Implementation Specialist" />
+          </div>
+          <div class="form-row">
+            <label>Instructions</label>
+            <textarea id="handoff-prompt" rows="2" placeholder="Instructions for the forked/handoff subagent…"></textarea>
+          </div>
+          <button id="btn-run-handoff" class="btn btn-xs btn-primary">🚀 Execute Fork / Handoff</button>
+        </div>
+      </div>
+
+      <!-- Bottom Pinned Unified Live Steer Bar -->
+      <footer class="mc-steer-bar">
+        <div class="steer-mode-row">
+          <select id="steer-mode" class="steer-mode-select">
+            <option value="steer">⚡ Steer Mid-Turn (turn/steer / live inject)</option>
+            <option value="queue">📥 Queue Next Turn (thread/queue/add)</option>
+            <option value="interrupt_and_steer">🛑 Interrupt & Redirect Now</option>
+          </select>
+          <span id="steer-feedback" class="steer-feedback"></span>
+        </div>
+        <div class="steer-input-row">
+          <textarea id="steer-input" rows="2" placeholder="Steer this subagent in real time (works on both Codex & Gemini subagents)… Enter to send, Shift+Enter for newline"></textarea>
+          <button id="btn-send-steer" class="btn btn-primary steer-send-btn">Steer</button>
+        </div>
+      </footer>
+    </main>
+
+    <!-- Spawn Codex Modal -->
+    <div id="spawn-modal" class="modal-backdrop hidden">
+      <div class="modal-card">
+        <div class="modal-header">
+          <strong>Launch New Codex Subagent Thread</strong>
+          <button id="btn-close-modal" class="btn btn-xs">✕</button>
+        </div>
+        <div class="form-row">
+          <label>Role Title</label>
+          <input type="text" id="spawn-role" value="Codex Architecture Specialist" />
+        </div>
+        <div class="form-row">
+          <label>Working Directory (cwd)</label>
+          <input type="text" id="spawn-cwd" placeholder="/home/zhdi/build_part/agy_subagent" />
+        </div>
+        <div class="form-row">
+          <label>Reasoning Effort</label>
+          <select id="spawn-effort">
+            <option value="medium">medium</option>
+            <option value="high" selected>high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="ultra">ultra</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Initial Task Prompt</label>
+          <textarea id="spawn-prompt" rows="3" placeholder="Describe the task for the Codex subagent…"></textarea>
+        </div>
+        <div class="btn-row">
+          <button id="btn-confirm-spawn" class="btn btn-primary">Launch Codex Subagent</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

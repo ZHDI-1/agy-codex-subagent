@@ -1,0 +1,13 @@
+{
+  "name": "codex-subagent",
+  "displayName": "Codex & Unified Subagent Mission Control",
+  "version": "1.0.0",
+  "description": "Integrates OpenAI Codex (via codex app-server daemon) as a native Antigravity subagent with mid-turn steering, live trajectory mirroring, and a Unified Subagent Mission Control Sidecar UI that manages both Gemini and Codex subagents.",
+  "logo": "assets/logo.svg",
+  "author": "Antigravity Engineering",
+  "suggestedPrompts": [
+    "Invoke the codex subagent to implement and test a module while inspecting its live plan and diff",
+    "List all active Gemini and Codex subagents and steer an in-progress turn",
+    "Run a Gemini research subagent and hand off its findings to a Codex subagent"
+  ]
+}

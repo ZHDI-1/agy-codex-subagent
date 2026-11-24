@@ -6,9 +6,7 @@ Integrates **OpenAI Codex (`codex app-server` daemon)** into **Google Antigravit
 
 ## Core Highlights
 
-1. **True Zero-Gemini-Token Hook Interception (`PreInvocation`)**:
-   - Subagents invoked via `invoke_subagent(TypeName="codex")` or followed up via `send_message` are intercepted by [`codex_hook_intercept.py`](plugins/codex-subagent/bin/codex_hook_intercept.py) before `ordinaryExecutor` makes a Gemini LLM call.
-   - Messages are drained directly from `<appDataDir>/brain/<convId>/.system_generated/messages/undelivered/` and dispatched over WebSocket-over-AF_UNIX (`~/.codex/app-server-control/app-server-control.sock`) to the persistent `codex app-server` daemon, followed by `LanguageServerService/CancelCascadeInvocation(notifyParent=False)` so **0 Gemini tokens** are consumed.
+1. **Two Antigravity execution backends**. Both send work over the Codex app-server Unix WebSocket. The persistent `sdkExecutor` uses Antigravity's `commandSpec` lifecycle. The `preInvocation` backend routes a Markdown agent through the hook and stops its Gemini invocation before generation.
 2. **Full Session Intervention & Mid-Turn Steering (`turn/steer`)**:
    - Because tasks run on persistent `codex app-server` threads rather than one-shot CLI processes, you can steer an actively running turn mid-flight (`turn/steer` with `expectedTurnId`), queue follow-up turns (`thread/queue/add`), interrupt (`turn/interrupt`), fork threads (`thread/fork`), revert turns (`thread/revert`), or dynamically hot-swap `model` and `effort` (`low` / `medium` / `high` / `xhigh` / `ultra`).
 3. **100% Native `agy` Subagent Experience**:
@@ -17,7 +15,7 @@ Integrates **OpenAI Codex (`codex app-server` daemon)** into **Google Antigravit
 4. **Unified Gemini + Codex Subagent Mission Control (3 Surfaces)**:
    - **Terminal `tmux` Split-View TUI (`curses`)**: [`codex_mission_control_tui.py`](plugins/codex-subagent/bin/codex_mission_control_tui.py) opens a `pi`-style right-hand split pane directly inside `tmux` alongside `agy`.
    - **Web / Sidecar Auxiliary Pane UI (`SIDECAR_UI_ENTRYPOINT_AUX_PANE`)**: [`sidecars/subagent_mission_control/`](plugins/codex-subagent/sidecars/subagent_mission_control/) works both inside the Antigravity 2.0 Desktop Auxiliary Pane and as a standalone browser dashboard (`http://127.0.0.1:18766`).
-   - **Unified MCP Server (`codex-subagent-control`)**: [`codex_mcp_server.py`](plugins/codex-subagent/bin/codex_mcp_server.py) exposes 8 unified tools (`subagent_list`, `subagent_inspect`, `subagent_steer`, `subagent_interrupt`, `subagent_revert`, `subagent_fork`, `subagent_configure`, `subagent_handoff`) across both Codex and Gemini subagents.
+   - **Unified MCP Server (`codex-subagent-control`)**: [`codex_mcp_server.py`](plugins/codex-subagent/bin/codex_mcp_server.py) exposes unified session tools (`subagent_list`, `subagent_inspect`, `subagent_steer`, `subagent_interrupt`, `subagent_revert`, `subagent_fork`, `subagent_configure`, `subagent_handoff`) across both Codex and Gemini subagents.
 
 ---
 
@@ -26,11 +24,21 @@ Integrates **OpenAI Codex (`codex app-server` daemon)** into **Google Antigravit
 ```bash
 git clone git@github.com:ZHDI-1/agy-codex-subagent.git
 cd agy-codex-subagent
-chmod +x install.sh
-./install.sh
+./install.sh                     # repository default, preInvocation
+./install.sh --mode=sdkExecutor  # select the native persistent executor
+./install.sh --mode=preInvocation
 ```
 
----
+The installer writes the selected mode to `plugins/codex-subagent/config.json` and updates the workspace and global agent definitions. The checked-in [example configuration](plugins/codex-subagent/config.example.json) supplies the defaults. This checkout's local configuration selects `sdkExecutor`. The installer keeps the Markdown definition in the plugin bundle for `agy plugin validate`.
+
+| Mode | How Antigravity runs Codex | When to choose it |
+| --- | --- | --- |
+| `preInvocation` | Starts a Markdown agent. The hook forwards the input, then terminates the Gemini invocation before generation. | Default for wider compatibility. Requires the PreInvocation hook and uses a handoff outside Antigravity's native execution lease. |
+| `sdkExecutor` | Starts a long-lived executable from a JSON agent definition. NDJSON requests reach the same Codex thread, SIGINT interrupts the active turn, and the language server releases the lease on terminal completion. | Choose when your Antigravity build supports `commandSpec` and `SignalExecutableIdle`. Native BUSY/IDLE status and cancellation follow the executor lifecycle. |
+
+A Markdown fallback still uses the hook in SDK mode. When switching modes, start a fresh Antigravity session to load the generated definition. An already-running bridge from the previous plugin version must be restarted to load the new API.
+
+The default Codex settings are `gpt-6.2-sol`, `xhigh`, `never` approvals, and `danger-full-access` sandbox mode. Set `sandboxMode` and `approvalPolicy` in the local config or in a profile to override them.
 
 ## Usage
 
@@ -40,7 +48,11 @@ Ask the main agent naturally:
 - *"Steer the running `codex` subagent: do not modify public headers, only internal implementation."*
 - *"Hand off the findings from the `research` subagent to a `codex` subagent to implement the fix."*
 
-### 2. `send_message` Control Prefixes
+### 2. Define a Codex profile
+
+Call the MCP tool `subagent_define_profile`, open **Handoff & Config** in Mission Control, or press **p** in the TUI. For example, a profile named `codex-reviewer` can use model `gpt-6.2-sol`, effort `high`, and the system prompt “Review changes for correctness and test gaps.” Invoke it with `invoke_subagent(TypeName="codex-reviewer")`. The bridge writes native definitions in the workspace and global config. `subagent_list_profiles` returns the saved profiles.
+
+### 3. `send_message` Control Prefixes
 When messaging a `codex` subagent via `send_message(Recipient=<conversationId>, Message=...)`:
 - Plain text: Automatically runs `turn/steer` if a turn is active, or `turn/start` on the same persistent `threadId` if idle.
 - `[STEER] <instruction>`: Explicitly mid-turn steer the active turn.
@@ -50,7 +62,7 @@ When messaging a `codex` subagent via `send_message(Recipient=<conversationId>, 
 - `[EFFORT:low|medium|high|xhigh|ultra]` / `[MODEL:<model>]`: Update reasoning effort or model (`turn/settings/update`).
 - `[COMPACT]`: Trigger context compaction (`thread/compact/start`).
 
-### 3. Opening the Mission Control UI
+### 4. Opening the Mission Control UI
 
 #### A. Right-Hand `tmux` Split-View TUI (Recommended for CLI / TUI users)
 ```bash
@@ -67,6 +79,7 @@ python3 plugins/codex-subagent/bin/codex_mission_control_tui.py --split --all
   - `F` (`Shift+f`): Fork Codex thread (`thread/fork`)
   - `r`: Revert last `N` turns/steps
   - `m`: Change reasoning effort
+  - `p`: Define or update a Codex profile
   - `h`: Cross-engine handoff (`Gemini research -> Codex coding`)
   - `Q` / `Esc`: Close split view
 
@@ -84,3 +97,6 @@ Then open **`http://127.0.0.1:18766`** in your browser (or open the **Subagent M
 agy plugin validate ./plugins/codex-subagent
 python3 ./tests/test_e2e_all_phases.py
 ```
+
+
+The suite includes deterministic installer, protocol, and state-machine tests. The live Phase 1–3 and SDK tests use an isolated bridge and fixture database. They require loopback sockets, the local authenticated Codex app-server, and Node.js. The [architecture review](ARCHITECTURE_REVIEW.md) describes the turn and lease boundaries.

@@ -36,8 +36,8 @@
     </section>
 
     <!-- Active Subagent Inspector -->
-    <main id="inspector-pane" class="mc-inspector hidden">
-      <div class="inspector-header">
+    <main id="inspector-pane" class="mc-inspector">
+      <div class="inspector-header hidden">
         <div class="inspector-meta">
           <div class="inspector-title-line">
             <span id="insp-engine-badge" class="engine-pill">CODEX</span>
@@ -104,7 +104,61 @@
 
       <!-- Tab 4: Cross-Engine Handoff, Fork & Dynamic Config -->
       <div id="tab-handoff" class="tab-panel hidden">
-        <div class="panel-section">
+        <section class="panel-section">
+          <h4>Create / Manage Codex Subagent Profile (Provider)</h4>
+          <div class="form-row">
+            <label for="profile-select">Profile</label>
+            <select id="profile-select"><option value="">New profile</option></select>
+          </div>
+          <form id="profile-form">
+            <div class="form-row">
+              <label for="profile-name">Agent name</label>
+              <input id="profile-name" placeholder="codex-reviewer" pattern="[a-z][a-z0-9]*(?:-[a-z0-9]+)*" maxlength="64" required />
+            </div>
+            <div class="form-row">
+              <label for="profile-description">Description</label>
+              <input id="profile-description" />
+            </div>
+            <div class="form-row">
+              <label for="profile-model">Codex model</label>
+              <input id="profile-model" list="profile-models" required />
+              <datalist id="profile-models">
+                <option value="gpt-6.2-sol"></option>
+                <option value="gpt-5.4"></option>
+                <option value="o3"></option>
+              </datalist>
+            </div>
+            <div class="form-row">
+              <label for="profile-effort">Reasoning effort</label>
+              <select id="profile-effort">
+                <option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>ultra</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="profile-mode">Execution mode</label>
+              <select id="profile-mode"><option>preInvocation</option><option>sdkExecutor</option></select>
+            </div>
+            <div class="form-row">
+              <label for="profile-sandbox">Sandbox</label>
+              <select id="profile-sandbox"><option>read-only</option><option>workspace-write</option><option>danger-full-access</option></select>
+            </div>
+            <div class="form-row">
+              <label for="profile-approval">Approval policy</label>
+              <select id="profile-approval"><option>never</option><option>on-request</option><option>untrusted</option></select>
+            </div>
+            <div class="form-row">
+              <label for="profile-prompt">System instructions</label>
+              <textarea id="profile-prompt" rows="4"></textarea>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-xs btn-primary" type="submit">Save profile</button>
+              <button id="profile-delete" class="btn btn-xs" type="button" disabled>Delete profile</button>
+            </div>
+            <p id="profile-feedback" role="status"></p>
+          </form>
+        </section>
+
+        <div class="panel-section session-controls hidden">
           <h4>⚙️ Live Session Settings (<code>turn/settings/update</code>)</h4>
           <div class="form-row">
             <label>Model</label>
@@ -133,7 +187,7 @@
           </div>
         </div>
 
-        <div class="panel-section">
+        <div class="panel-section session-controls hidden">
           <h4>🔀 Thread Fork & Cross-Engine Handoff (Gemini ⇄ Codex)</h4>
           <p class="help-text">Fork this subagent's thread or hand off its latest findings & workspace to another engine.</p>
           <div class="form-row">
@@ -157,7 +211,7 @@
       </div>
 
       <!-- Bottom Pinned Unified Live Steer Bar -->
-      <footer class="mc-steer-bar">
+      <footer class="mc-steer-bar hidden">
         <div class="steer-mode-row">
           <select id="steer-mode" class="steer-mode-select">
             <option value="steer">⚡ Steer Mid-Turn (turn/steer / live inject)</option>
@@ -191,8 +245,10 @@
         <div class="form-row">
           <label>Reasoning Effort</label>
           <select id="spawn-effort">
+            <option value="" selected>Configured default</option>
+            <option value="low">low</option>
             <option value="medium">medium</option>
-            <option value="high" selected>high</option>
+            <option value="high">high</option>
             <option value="xhigh">xhigh</option>
             <option value="ultra">ultra</option>
           </select>

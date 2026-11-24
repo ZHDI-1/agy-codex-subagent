@@ -12,6 +12,9 @@ Launch a Codex subagent using the standard `invoke_subagent` tool:
 
 `invoke_subagent` returns `{ conversationId }` immediately and runs asynchronously on the Codex App-Server Daemon. When the Codex turn completes, it automatically wakes you up with a structured report and unified diff summary.
 
+Define specialized types with `subagent_define_profile` and discover them with
+`subagent_list_profiles`. Use the profile's name as `TypeName` when invoking it.
+
 ## 2. Mid-Turn Steering & Session Intervention
 
 While a `codex` (or Gemini `self`/`research`) subagent is running, you have full intervention authority:

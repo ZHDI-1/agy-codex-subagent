@@ -55,6 +55,12 @@ try {
     run() {
       const port = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || 18766);
       const server = createServer(async (req, res) => {
+        const host = req.headers.host?.split(':')[0];
+        if (host !== '127.0.0.1' && host !== 'localhost') {
+          res.writeHead(403);
+          res.end();
+          return;
+        }
         const url = new URL(req.url, `http://127.0.0.1:${port}`);
         if (req.method === 'GET' && this.#pages.has(url.pathname)) {
           const html = await this.#pages.get(url.pathname)();
@@ -64,16 +70,28 @@ try {
         }
         const methodMap = this.#apis.get(url.pathname);
         if (methodMap && methodMap.has(req.method)) {
-          let data = {};
-          if (req.method === 'GET') {
-            for (const [k, v] of url.searchParams.entries()) data[k] = v;
-          } else {
-            const chunks = [];
-            for await (const c of req) chunks.push(c);
-            const raw = Buffer.concat(chunks).toString('utf-8');
-            if (raw.trim()) data = JSON.parse(raw);
-          }
           try {
+            let data = {};
+            if (req.method === 'GET') {
+              data = Object.fromEntries(url.searchParams);
+            } else {
+              const expectedOrigin = `http://${req.headers.host}`;
+              if ((req.headers.origin && req.headers.origin !== expectedOrigin) ||
+                  !req.headers['content-type']?.toLowerCase().startsWith('application/json')) {
+                res.writeHead(403);
+                res.end();
+                return;
+              }
+              const chunks = [];
+              let size = 0;
+              for await (const chunk of req) {
+                size += chunk.length;
+                if (size > 4 * 1024 * 1024) throw new Error('Request body is too large');
+                chunks.push(chunk);
+              }
+              const raw = Buffer.concat(chunks).toString('utf-8');
+              if (raw.trim()) data = JSON.parse(raw);
+            }
             const out = await methodMap.get(req.method)(data);
             if (out instanceof ResponseClass) {
               res.writeHead(out.status || 200, {
@@ -105,7 +123,7 @@ let bridgeStarting = false;
 
 async function ensureBridgeDaemon() {
   try {
-    const r = await fetch(`${BRIDGE_BASE}/api/health`, { signal: AbortSignal.timeout(1200) });
+    const r = await fetch(`${BRIDGE_BASE}/api/ready`, { signal: AbortSignal.timeout(1200) });
     if (r.ok) return true;
   } catch {}
 
@@ -117,6 +135,7 @@ async function ensureBridgeDaemon() {
         stdio: 'ignore',
         env: { ...process.env },
       });
+      child.on('error', (error) => console.error('[subagent_mission_control] bridge spawn failed:', error));
       child.unref();
     } catch (e) {
       console.error('[subagent_mission_control] failed to spawn bridge daemon:', e);
@@ -130,7 +149,7 @@ async function ensureBridgeDaemon() {
   for (let i = 0; i < 15; i++) {
     await new Promise((r) => setTimeout(r, 200));
     try {
-      const r = await fetch(`${BRIDGE_BASE}/api/health`, { signal: AbortSignal.timeout(800) });
+      const r = await fetch(`${BRIDGE_BASE}/api/ready`, { signal: AbortSignal.timeout(800) });
       if (r.ok) return true;
     } catch {}
   }
@@ -235,10 +254,14 @@ app.api('/api/subagent/spawn-codex', async (data) => {
     parentConversationId: data.parentConversationId || app.config.conversationId || '',
     role: data.role || 'Codex Specialist',
     cwd: data.cwd || '',
-    model: data.model || '',
-    effort: data.effort || 'high',
+    model: data.model || undefined,
+    effort: data.effort || undefined,
     userInput: data.prompt || '',
   });
 }, 'POST');
+
+app.api('/api/profiles', () => bridgeGet('/api/profiles'), 'GET');
+app.api('/api/profiles/define', (data) => bridgePost('/api/profiles/define', data), 'POST');
+app.api('/api/profiles/delete', (data) => bridgePost('/api/profiles/delete', data), 'POST');
 
 app.run();

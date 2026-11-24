@@ -58,6 +58,8 @@ function renderRoster() {
   el('roster-count').textContent = `${filtered.length} subagent${filtered.length === 1 ? '' : 's'}`;
 
   if (!filtered.length) {
+    state.selectedId = null;
+    renderInspector(null);
     container.innerHTML = `<div class="mc-empty">No subagents found${state.currentOnly ? ' for current conversation' : ''}. Invoke <code>codex</code>, <code>self</code>, or <code>research</code>, or click <b>+ New Codex</b>.</div>`;
     return;
   }
@@ -124,11 +126,14 @@ function formatUnifiedDiff(diffText) {
 
 function renderInspector(data) {
   const pane = el('inspector-pane');
-  if (!data || !data.summary) {
-    pane.classList.add('hidden');
+  const hasSession = Boolean(data?.summary);
+  for (const section of pane.querySelectorAll('.inspector-header, .mc-steer-bar, .session-controls')) {
+    section.classList.toggle('hidden', !hasSession);
+  }
+  if (!hasSession) {
+    el('approval-banner').classList.add('hidden');
     return;
   }
-  pane.classList.remove('hidden');
 
   const s = data.summary;
   const tr = data.transcript || {};
@@ -238,9 +243,11 @@ function renderInspector(data) {
 }
 
 async function pollInspect() {
-  if (!state.selectedId) return;
+  const conversationId = state.selectedId;
+  if (!conversationId) return;
   try {
-    const data = await apiGet('/api/subagent/inspect', { conversationId: state.selectedId });
+    const data = await apiGet('/api/subagent/inspect', { conversationId });
+    if (state.selectedId !== conversationId) return;
     state.inspected = data;
     renderInspector(data);
   } catch (e) {
@@ -273,7 +280,72 @@ async function pollAll() {
 }
 
 // Event Listeners
+const profileFields = {
+  name: 'profile-name',
+  description: 'profile-description',
+  model: 'profile-model',
+  effort: 'profile-effort',
+  executionMode: 'profile-mode',
+  sandboxMode: 'profile-sandbox',
+  approvalPolicy: 'profile-approval',
+  systemPrompt: 'profile-prompt',
+};
+
+function setupProfiles() {
+  const selector = el('profile-select');
+  const status = el('profile-feedback');
+  const form = el('profile-form');
+  const deleteButton = el('profile-delete');
+  let profiles = {};
+  let defaults = {};
+
+  function showProfile() {
+    const saved = profiles[selector.value];
+    const values = saved || defaults;
+    for (const [field, id] of Object.entries(profileFields)) el(id).value = values[field] ?? '';
+    el('profile-name').readOnly = Boolean(saved);
+    deleteButton.disabled = !saved;
+  }
+
+  async function refreshProfiles(selected = selector.value) {
+    const result = await apiGet('/api/profiles');
+    if (result.error) throw new Error(result.error);
+    profiles = Object.fromEntries(result.profiles.map((profile) => [profile.name, profile]));
+    defaults = result.defaults;
+    selector.replaceChildren(new Option('New profile', ''));
+    for (const name of Object.keys(profiles)) selector.add(new Option(name, name));
+    selector.value = profiles[selected] ? selected : '';
+    showProfile();
+  }
+
+  async function changeProfile(path, body, selected, message) {
+    try {
+      const result = await apiPost(path, body);
+      if (result.error) throw new Error(result.error);
+      await refreshProfiles(selected);
+      status.textContent = message;
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  }
+
+  selector.addEventListener('change', showProfile);
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const body = Object.fromEntries(Object.entries(profileFields).map(([field, id]) => [field, el(id).value]));
+    changeProfile('/api/profiles/define', body, body.name, `Saved ${body.name}.`);
+  });
+  deleteButton.addEventListener('click', () => {
+    const name = selector.value;
+    if (name && window.confirm(`Delete the Codex profile ${name}?`)) {
+      changeProfile('/api/profiles/delete', { name }, '', `Deleted ${name}.`);
+    }
+  });
+  refreshProfiles().catch((error) => { status.textContent = error.message; });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  setupProfiles();
   // Filter toggle
   el('chk-current-only').addEventListener('change', (e) => {
     state.currentOnly = e.target.checked;

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "codex-subagent-control": {
-      "command": "python3",
+      "command": "/usr/bin/python3",
       "args": [
         "-u",
         "/home/zhdi/build_part/agy_subagent/plugins/codex-subagent/bin/codex_mcp_server.py"

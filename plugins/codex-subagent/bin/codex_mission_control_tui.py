@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import curses
 import json
-import os
 import subprocess
 import sys
 import textwrap
@@ -24,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 BIN_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BIN_DIR))
 
-from codex_bridge_daemon import BRIDGE_HOST, BRIDGE_PORT, ensure_bridge_daemon_running
+from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running
 
 
 def fetch_json(url: str, timeout: float = 2.0) -> Dict[str, Any]:
@@ -54,7 +53,7 @@ class MissionControlTUI:
         self.selected_conv_id: str = ""
         self.detail: Optional[Dict[str, Any]] = None
         self.scroll_offset = 0
-        self.status_banner = "Ready — [s] Steer  [q] Queue  [i] Interrupt  [f] Fork  [r] Revert  [h] Handoff  [a] Scope"
+        self.status_banner = "Ready — [s] Steer  [q] Queue  [i] Interrupt  [f] Fork  [r] Revert  [h] Handoff  [p] Profiles"
         self.codex_connected = False
         self.codex_ua = ""
         self.ls_addr = ""
@@ -69,7 +68,7 @@ class MissionControlTUI:
         now = time.time()
         try:
             q = "?all=true" if self.show_all else ""
-            mc = fetch_json(f"{self.base_url}/api/mission-control{q}", timeout=1.5)
+            mc = fetch_json(f"{self.base_url}/api/subagents{q}", timeout=1.5)
             self.codex_connected = bool(mc.get("codexDaemonConnected"))
             self.codex_ua = str(mc.get("codexUserAgent") or "")
             self.ls_addr = str(mc.get("lsAddress") or "")
@@ -78,7 +77,7 @@ class MissionControlTUI:
             visible = self.filtered_subagents()
             if not visible and not self.show_all and self.subagents == []:
                 # Auto fallback to all history if current session has none
-                mc_all = fetch_json(f"{self.base_url}/api/mission-control?all=true", timeout=1.5)
+                mc_all = fetch_json(f"{self.base_url}/api/subagents?all=true", timeout=1.5)
                 if mc_all.get("subagents"):
                     self.show_all = True
                     self.subagents = mc_all.get("subagents") or []
@@ -142,6 +141,33 @@ class MissionControlTUI:
             curses.noecho()
             curses.curs_set(0)
 
+    def manage_profile(self, stdscr: Any) -> None:
+        try:
+            result = fetch_json(f"{self.base_url}/api/profiles")
+            profiles = {profile["name"]: profile for profile in result["profiles"]}
+            names = ", ".join(profiles) or "none"
+            name = self.prompt_input(stdscr, f"Profile ({names[:22]}): ")
+            if not name:
+                return
+            current = profiles.get(name, result["defaults"])
+            body = {"name": name}
+            for key, label in (
+                ("description", "Description"), ("model", "Model"), ("effort", "Effort"),
+                ("executionMode", "Mode"), ("sandboxMode", "Sandbox"), ("approvalPolicy", "Approval"),
+                ("systemPrompt", "System prompt"),
+            ):
+                value = current.get(key, "")
+                answer = self.prompt_input(stdscr, f"{label} [{value[:16]}]: ")
+                if answer:
+                    body[key] = answer.replace("\\n", "\n") if key == "systemPrompt" else answer
+            result = post_json(f"{self.base_url}/api/profiles/define", body)
+            self.status_banner = f"Saved profile {result['profile']['name']}"
+        except urllib.error.HTTPError as e:
+            with e:
+                self.status_banner = json.load(e).get("error", str(e))
+        except (OSError, KeyError, ValueError) as e:
+            self.status_banner = f"Profile update failed: {e}"
+
     def build_detail_lines(self, width: int) -> List[Tuple[str, int]]:
         lines: List[Tuple[str, int]] = []
         if not self.detail:
@@ -188,17 +214,25 @@ class MissionControlTUI:
             recent_steps = transcript.get("recentSteps") or []
             lines.append((f"▶ TRAJECTORY STEPS ({len(recent_steps)} recent):", curses.A_BOLD))
             for st in recent_steps[-25:]:
-                idx = st.get("index", "?")
+                idx = st.get("stepIndex", st.get("index", "?"))
                 stype = str(st.get("type") or "").replace("CORTEX_STEP_TYPE_", "")
                 status = str(st.get("status") or "").replace("CORTEX_STEP_STATUS_", "")
                 header = f"  #{idx} [{stype}] ({status})"
-                lines.append((header, curses.color_pair(4) | curses.A_BOLD))
-                text_body = str(st.get("summary") or st.get("thinking") or "").strip()
+                hdr_color = curses.color_pair(5) if "ERROR" in stype or "ERROR" in status else curses.color_pair(4)
+                lines.append((header, hdr_color | curses.A_BOLD))
+                text_body = str(
+                    st.get("response")
+                    or st.get("content")
+                    or st.get("summary")
+                    or st.get("error")
+                    or st.get("thinking")
+                    or ""
+                ).strip()
                 if text_body:
                     for ln in text_body.splitlines()[:8]:
                         for wrapped in textwrap.wrap(ln, max(20, width - 6)) or [""]:
                             lines.append((f"    {wrapped}", 0))
-                for tc in st.get("toolCalls") or []:
+                for tc in (st.get("tools") or st.get("toolCalls") or []):
                     lines.append((f"    ⚙ tool: {tc}", curses.color_pair(2)))
 
         elif self.active_tab == "diff":
@@ -229,8 +263,14 @@ class MissionControlTUI:
             lines.append(("", 0))
             lines.append(("▶ RECENT DAEMON / SUBAGENT EVENTS:", curses.A_BOLD))
             for ev in (self.detail.get("recentEvents") or [])[-20:]:
-                ts = time.strftime("%H:%M:%S", time.localtime(ev.get("timestamp", 0)))
-                lines.append((f"  {ts}  {ev.get('method')}: {ev.get('summary')}", curses.A_DIM))
+                raw_ts = ev.get("timestamp", "")
+                if isinstance(raw_ts, (int, float)):
+                    ts = time.strftime("%H:%M:%S", time.localtime(raw_ts))
+                else:
+                    ts = str(raw_ts)[11:19] or str(raw_ts)
+                ev_type = ev.get("type") or ev.get("method") or "event"
+                ev_sum = ev.get("summary") or ev.get("command") or ev.get("turnId") or ev.get("itemType") or ""
+                lines.append((f"  {ts}  {ev_type}: {ev_sum}", curses.A_DIM))
 
         return lines
 
@@ -320,7 +360,7 @@ class MissionControlTUI:
                 self.safe_addstr(stdscr, detail_start_y + i, 1, text, attr)
 
             # 5. Bottom Control & Status Bars
-            ctrl_bar = " [s]Steer [q]Queue [i]Interrupt [F]Fork [r]Revert [m]Model/Effort [h]Handoff [Q]Quit "
+            ctrl_bar = " [s]Steer [q]Queue [i]Interrupt [F]Fork [r]Revert [m]Effort [p]Profiles [h]Handoff [Q]Quit "
             self.safe_addstr(stdscr, h - 2, 0, ctrl_bar.ljust(max(0, w - 1)), curses.color_pair(1) | curses.A_REVERSE)
             self.safe_addstr(stdscr, h - 1, 0, f" {self.status_banner}", curses.color_pair(3))
 
@@ -432,6 +472,8 @@ class MissionControlTUI:
                         self.refresh_data(force_detail=True)
                     except Exception as e:
                         self.status_banner = f"Config failed: {e}"
+            elif ch == ord("p"):
+                self.manage_profile(stdscr)
             elif ch == ord("h") and self.selected_conv_id:
                 task = self.prompt_input(stdscr, "Handoff task instruction to Codex: ")
                 if task:
@@ -441,10 +483,10 @@ class MissionControlTUI:
                             {
                                 "sourceConversationId": self.selected_conv_id,
                                 "targetEngine": "codex",
-                                "taskInstruction": task,
+                                "prompt": task,
                             },
                         )
-                        self.status_banner = f"Handed off -> Codex conv {res.get('targetConversationId', '')[:12]}"
+                        self.status_banner = f"Handed off -> Codex conv {res.get('newConversationId', '')[:12]}"
                         self.refresh_data(force_detail=True)
                     except Exception as e:
                         self.status_banner = f"Handoff failed: {e}"

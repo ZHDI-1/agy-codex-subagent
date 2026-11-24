@@ -202,17 +202,17 @@ body {
   text-transform: lowercase;
 }
 
-.status-working {
+.status-working, .status-starting {
   background: rgba(59, 130, 246, 0.2);
   color: #60a5fa;
 }
 
-.status-awaiting_approval {
+.status-awaiting_approval, .status-interrupting {
   background: rgba(245, 158, 11, 0.25);
   color: #fbbf24;
 }
 
-.status-idle {
+.status-idle, .status-interrupted {
   background: rgba(139, 148, 158, 0.16);
   color: var(--text-muted);
 }

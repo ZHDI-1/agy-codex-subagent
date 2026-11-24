@@ -3,47 +3,23 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="${REPO_ROOT}/plugins/codex-subagent"
+GLOBAL_CONFIG="${AGY_CODEX_GLOBAL_CONFIG:-${HOME}/.gemini/config}"
+mode=preInvocation
+for arg in "$@"; do
+  case "$arg" in
+    --mode=preInvocation|--mode=sdkExecutor) mode="${arg#--mode=}" ;;
+    -h|--help) printf 'Usage: %s [--mode=preInvocation|--mode=sdkExecutor]\n' "$0"; exit 0 ;;
+    *) printf 'Unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
-echo "[1/3] Updating plugin absolute paths in hooks.json and mcp_config.json to ${PLUGIN_DIR} ..."
-cat > "${PLUGIN_DIR}/hooks.json" <<EOF
-{
-  "codex-subagent-interceptor": {
-    "enabled": true,
-    "PreInvocation": [
-      {
-        "type": "command",
-        "command": "python3 ${PLUGIN_DIR}/bin/codex_hook_intercept.py",
-        "timeout": 25
-      }
-    ]
-  }
-}
-EOF
+python3 "${PLUGIN_DIR}/bin/codex_profiles.py" --install-mode "$mode"
+mkdir -p "${GLOBAL_CONFIG}/plugins"
+ln -sfn "${PLUGIN_DIR}" "${GLOBAL_CONFIG}/plugins/codex-subagent"
 
-cat > "${PLUGIN_DIR}/mcp_config.json" <<EOF
-{
-  "mcpServers": {
-    "codex-subagent-control": {
-      "command": "python3",
-      "args": [
-        "-u",
-        "${PLUGIN_DIR}/bin/codex_mcp_server.py"
-      ]
-    }
-  }
-}
-EOF
-
-echo "[2/3] Linking plugin and codex subagent definition into ~/.gemini/config/ ..."
-mkdir -p "${HOME}/.gemini/config/plugins" "${HOME}/.gemini/config/agents"
-ln -sfn "${PLUGIN_DIR}" "${HOME}/.gemini/config/plugins/codex-subagent"
-ln -sfn "${PLUGIN_DIR}/agents/codex.md" "${HOME}/.gemini/config/agents/codex.md"
-
-echo "[3/3] Validating plugin with agy ..."
 if command -v agy >/dev/null 2>&1; then
   agy plugin validate "${PLUGIN_DIR}"
 elif [[ -x "${HOME}/.local/bin/agy" ]]; then
   "${HOME}/.local/bin/agy" plugin validate "${PLUGIN_DIR}"
 fi
-
-echo "✔ Installed codex-subagent plugin globally!"
+printf 'Installed codex-subagent with %s.\n' "$mode"

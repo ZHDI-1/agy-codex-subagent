@@ -16,28 +16,43 @@ End-to-End Verification Suite for All Phases of `codex-subagent`:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
 import os
+import queue
 import shutil
+import signal
 import socket
+import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
-REPO_ROOT = Path("/home/zhdi/build_part/agy_subagent")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIR = REPO_ROOT / "plugins" / "codex-subagent"
 BIN_DIR = PLUGIN_DIR / "bin"
 SIDECAR_DIR = PLUGIN_DIR / "sidecars" / "subagent_mission_control"
 
 sys.path.insert(0, str(BIN_DIR))
 
-from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running, summarize_transcript_file
+import codex_bridge_daemon as bridge_module
+import codex_hook_intercept as hook_module
+import codex_mcp_server as mcp_module
+import codex_profiles
+from codex_bridge_daemon import UnifiedSubagentBridge, summarize_transcript_file
 from codex_ws_client import CodexAppServerClient
 
 
@@ -57,39 +72,444 @@ def http_post_json(url: str, payload: dict) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def stop_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def wait_until(check, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if result := check():
+                return result
+        except OSError:
+            pass
+        time.sleep(0.03)
+    raise AssertionError("Timed out waiting for expected state")
+
+
+class ScriptedCodex(CodexAppServerClient):
+    """Capture the app-server wire parameters and control notification interleavings."""
+
+    def __init__(self, bridge):
+        super().__init__(auto_start_daemon=False)
+        self.bridge = bridge
+        self.calls = []
+        self.complete_on_start = False
+        self.turn = 0
+
+    def connect(self):
+        return {"userAgent": "scripted-codex"}
+
+    @property
+    def connection(self):
+        return self
+
+    def request(self, method, params=None, timeout=60):
+        self.calls.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "thread-1"}, "reasoningEffort": "low"}
+        if method == "turn/start":
+            self.turn += 1
+            turn = f"turn-{self.turn}"
+            self.bridge._on_codex_notification("turn/started", {
+                "threadId": params["threadId"], "turn": {"id": turn},
+            })
+            if self.complete_on_start:
+                self.complete(turn)
+            return {"turn": {"id": turn}}
+        if method == "turn/steer":
+            return {"turnId": params["expectedTurnId"]}
+        if method == "turn/interrupt":
+            self.complete(params["turnId"], "interrupted")
+        if method == "thread/fork":
+            return {"thread": {"id": "thread-fork"}}
+        return {}
+
+    def complete(self, turn, status="completed"):
+        self.bridge._on_codex_notification("turn/completed", {
+            "threadId": "thread-1", "turn": {"id": turn, "status": status},
+        })
+
+
+class TestExecutorAndProfiles(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="agy_codex_regression_")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        profile_dir = self.root / "profiles"
+        self.enterContext(patch.dict(os.environ, {"AGY_CODEX_APP_DATA_DIR": temp.name}))
+        self.enterContext(patch.multiple(
+            codex_profiles, PROFILE_DIR=profile_dir, CONFIG_PATH=self.root / "config.json",
+            WORKSPACE_ROOT=self.root, GLOBAL_AGENTS=self.root / "global-agents",
+        ))
+        self.enterContext(patch.object(bridge_module, "PROFILE_DIR", profile_dir))
+        self.bridge = UnifiedSubagentBridge()
+        self.bridge.codex = self.codex = ScriptedCodex(self.bridge)
+
+    def test_plugin_validation_zero_warnings(self):
+        agy = shutil.which("agy")
+        self.assertIsNotNone(agy, "agy is required for plugin validation")
+        proc = subprocess.run([agy, "plugin", "validate", str(PLUGIN_DIR)],
+                              capture_output=True, text=True, timeout=10)
+        output = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, output)
+        self.assertIn("Validation passed", output)
+        self.assertNotIn("⚠", output)
+        self.assertNotRegex(output.lower(), r"[1-9]\d* warnings?")
+        print(output.rstrip())
+
+    def test_profile_provider_routes_and_persists(self):
+        profile = {"name": "codex-reviewer", "description": "Review: change",
+                   "model": "o3", "effort": "ultra", "systemPrompt": "Review the patch.",
+                   "sandboxMode": "read-only", "approvalPolicy": "on-request", "executionMode": "sdkExecutor"}
+        replies = {
+            "/api/profiles/define": self.bridge.define_profile, "/api/profiles": self.bridge.list_profiles,
+        }
+        with patch.object(mcp_module, "bridge_post", side_effect=lambda path, data: replies[path](data)), \
+             patch.object(mcp_module, "bridge_get", side_effect=lambda path: replies[path]()):
+            result = mcp_module.handle_tool_call("subagent_define_profile", profile)
+            self.assertEqual(result["profile"], profile)
+            self.assertEqual(mcp_module.handle_tool_call("subagent_list_profiles", {})["profiles"], [profile])
+
+        for path in result["definitions"]:
+            spec = json.loads(Path(path).read_text())
+            self.assertTrue(spec["subagent"])
+            self.assertEqual(spec["commandSpec"]["args"][-2:], ["--agent-name", profile["name"]])
+        self.assertTrue((self.root / "profiles/codex-reviewer.json").exists())
+        restored = UnifiedSubagentBridge()
+        self.assertEqual(restored.list_profiles()["profiles"], [profile])
+        conv = "test-reviewer"
+        self.bridge.register_sdk({"conversationId": conv, "agentName": profile["name"], "sdkInstanceId": "instance"})
+        self.codex.complete_on_start = True
+        result = self.bridge.dispatch_subagent_input(
+            conv, "Find problems", agent_name=profile["name"], execution_mode="sdkExecutor", sdk_instance="instance",
+        )
+        start, turn = [params for method, params in self.codex.calls if method in ("thread/start", "turn/start")]
+        self.assertEqual((start["model"], start["config"]["model_reasoning_effort"]), ("o3", "ultra"))
+        self.assertEqual((start["sandbox"], start["approvalPolicy"]), ("read-only", "on-request"))
+        self.assertIn("Review the patch.", start["developerInstructions"])
+        self.assertEqual(turn["input"][0]["text"], "Review the patch.\n\nFind problems")
+        self.assertEqual(turn["effort"], "ultra")
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(self.bridge.sessions_by_conv[conv]["turnHistory"][0]["turnId"], result["turnId"])
+
+        self.bridge.define_profile({"name": profile["name"], "executionMode": "preInvocation"})
+        self.assertFalse((self.root / ".agents/agents/codex-reviewer.json").exists())
+        self.assertIn('description: "Review: change"', (self.root / ".agents/agents/codex-reviewer.md").read_text())
+        self.assertTrue(self.bridge.delete_profile(profile["name"])["deleted"])
+        self.assertEqual(UnifiedSubagentBridge().list_profiles()["profiles"], [])
+
+    def test_serialized_dispatch_steers_and_cleans_approvals(self):
+        conv = "concurrent"
+        with ThreadPoolExecutor(2) as workers:
+            results = list(workers.map(lambda text: self.bridge.dispatch_subagent_input(conv, text), ("one", "two")))
+        self.assertCountEqual([r["action"] for r in results], ["turn/start", "turn/steer"])
+        self.assertEqual(sum(method == "thread/start" for method, _ in self.codex.calls), 1)
+        self.bridge._on_codex_server_request(44, "item/commandExecution/requestApproval", {
+            "threadId": "thread-1", "turnId": "turn-1",
+        }, lambda **_kwargs: None)
+        self.assertEqual(len(self.bridge.pending_approvals), 1)
+        self.assertEqual(self.bridge.sessions_by_conv[conv]["status"], "awaiting_approval")
+        self.assertEqual(self.bridge.dispatch_subagent_input(conv, "steer while awaiting")["action"], "turn/steer")
+        self.bridge.interrupt_subagent(conv)
+        self.assertEqual(self.bridge.sessions_by_conv[conv]["status"], "interrupted")
+        self.assertFalse(self.bridge.pending_approvals)
+        self.assertFalse(self.bridge._approval_replies)
+        next_turn = self.bridge.dispatch_subagent_input(conv, "new turn")
+        self.codex.complete("turn-1", "interrupted")
+        self.assertEqual(self.bridge.sessions_by_conv[conv]["activeTurnId"], next_turn["turnId"])
+        self.assertEqual(len(self.bridge.sessions_by_conv[conv]["turnHistory"]), 1)
+
+    def test_daemon_signals_idle_with_sdk_credentials(self):
+        conv = "sdk-registered"
+        self.bridge.register_sdk({
+            "conversationId": conv, "sdkInstanceId": "live", "lsAddress": "localhost:5544", "csrfToken": "token",
+        })
+        self.bridge.dispatch_subagent_input(conv, "work", execution_mode="sdkExecutor", sdk_instance="live")
+        with patch.object(self.bridge, "lsrpc") as ls:
+            self.codex.complete("turn-1")
+            wait_until(lambda: self.bridge.sdk_status(conv, "live")["idleSignal"] == "sent")
+            ls.assert_called_once_with("SignalExecutableIdle", {"conversationId": conv}, timeout=2,
+                                       ls_address="localhost:5544", csrf_token="token")
+        self.assertTrue(self.bridge.sdk_status(conv, "other")["replaced"])
+
+    def test_hook_bypasses_native_definition_and_uses_markdown_fallback(self):
+        self.bridge.define_profile({"name": "codex-audit", "executionMode": "sdkExecutor"})
+        payload = {"agentName": "codex-audit", "conversationId": "hook-conv", "cwd": str(self.root),
+                   "lastUserInput": "hook prompt"}
+        script = BIN_DIR / "codex_hook_intercept.py"
+        env = {
+            **os.environ, "AGY_CODEX_PROFILE_DIR": str(self.root / "profiles"), "AGY_CODEX_WORKSPACE_ROOT": str(self.root),
+            "AGY_CODEX_GLOBAL_AGENTS": str(self.root / "global-agents"),
+        }
+        proc = subprocess.run([sys.executable, str(script)], env=env, input=json.dumps(payload),
+                              text=True, capture_output=True, timeout=5)
+        self.assertEqual(json.loads(proc.stdout), {})
+        # Changing the effective definition leaves the configured SDK mode intact.
+        (self.root / ".agents/agents/codex-audit.json").unlink()
+        (self.root / ".agents/agents/codex-audit.md").write_text("fallback")
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(sys, "stdout", io.StringIO()) as output, \
+             patch.object(hook_module, "ensure_bridge_daemon_running", return_value="http://bridge"), \
+             patch.object(hook_module, "post_bridge_json", return_value={"action": "turn/start"}) as post:
+            hook_module.main()
+        self.assertEqual(post.call_args.args[2]["agentName"], "codex-audit")
+        self.assertEqual(post.call_args.args[2]["executionMode"], "preInvocation")
+        self.assertEqual(json.loads(output.getvalue())["terminationBehavior"], "terminate")
+
+    def test_sdk_process_ndjson_steer_sigint_and_idle(self):
+        # Run the real stdin and signal loop. Intercept only the network boundary.
+        bridge_stub = r"""
+import json, sys
+import codex_sdk_executor as sdk
+status = {}
+turn = 0
+def post(_base, path, payload, **_kwargs):
+    global turn
+    print(json.dumps([path, payload]), flush=True)
+    if path == "/api/ls-credentials":
+        status.update(registered=True, status="idle")
+    if path == "/api/dispatch":
+        if not status.get("activeTurnId"):
+            turn += 1
+            status.update(status="working", activeTurnId=f"turn-{turn}")
+        return {"turnId": status["activeTurnId"]}
+    if path == "/api/subagent/interrupt":
+        active = status.pop("activeTurnId", None)
+        status.update(status="interrupted")
+        return {"interruptedTurnId": active}
+    return {}
+sdk.post_bridge_json = post
+sdk.ensure_bridge_daemon_running = lambda *a: "http://bridge"
+sdk.SdkExecutor.status = lambda self: status
+sdk.language_server_post = lambda address, token, method, payload: print(
+    json.dumps([method, [address, token, payload]]), flush=True)
+sdk.main()
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", bridge_stub, "--agent-name", "codex-reviewer"],
+            env={**os.environ, "PYTHONPATH": str(BIN_DIR)}, text=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.addCleanup(proc.communicate, timeout=5)
+        self.addCleanup(stop_process, proc)
+        assert proc.stdin and proc.stdout
+        output = queue.Queue()
+        threading.Thread(target=lambda: [output.put(json.loads(line)) for line in proc.stdout], daemon=True).start()
+
+        def send(item):
+            proc.stdin.write(json.dumps(item) + "\n")
+            proc.stdin.flush()
+
+        send({"type": "init", "conversation_id": "sdk-test", "parent_conversation_id": "parent",
+              "language_server_address": "localhost:23456", "csrf_token": "sdk-test-token"})
+        path, payload = output.get(timeout=5)
+        self.assertEqual(path, "/api/ls-credentials")
+        self.assertEqual((payload["agentName"], payload["parentConversationId"]), ("codex-reviewer", "parent"))
+        send({"type": "request", "request": {"cascadeId": "sdk-test", "items": [{"text": "first task"}], "clientMessageId": "sdk-req-1"}})
+        dispatch = output.get(timeout=5)[1]
+        self.assertEqual(dispatch["userInput"], "first task")
+        self.assertEqual(dispatch["inputId"], "sdk-req-1")
+
+        msg_dir = self.root / "brain/sdk-test/.system_generated/messages"
+        marker = msg_dir / "undelivered/msg"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+        (msg_dir / "msg.json").write_text(json.dumps({"sender": {"conversationId": "parent"}, "content": "steer task"}))
+        send({"type": "request", "request": {}})
+        self.assertEqual(output.get(timeout=5)[1]["userInput"], "steer task")
+        wait_until(lambda: not marker.exists())
+
+        proc.send_signal(signal.SIGINT)
+        self.assertEqual(output.get(timeout=5)[0], "/api/subagent/interrupt")
+        self.assertEqual(output.get(timeout=5), [
+            "SignalExecutableIdle", ["localhost:23456", "sdk-test-token", {"conversationId": "sdk-test"}],
+        ])
+        self.assertIsNone(proc.poll())
+        proc.stdin.close()
+        proc.stdin = None
+        self.assertEqual(output.get(timeout=5)[0], "/api/subagent/sdk-unregister")
+        self.assertEqual(proc.wait(timeout=5), 0)
+
+    def test_websocket_reply_progress_during_callback(self):
+        path = self.root / "fake-socket"
+        path.touch()
+        client_read, server_write = os.pipe()
+        server_read, client_write = os.pipe()
+        client = CodexAppServerClient(path, auto_start_daemon=False)
+
+        class PipeSocket:
+            def __init__(self, incoming, outgoing):
+                self.incoming = incoming
+                self.outgoing = outgoing
+
+            def connect(self, _path):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def recv(self, length):
+                return os.read(self.incoming, length)
+
+            def sendall(self, data):
+                while data:
+                    data = data[os.write(self.outgoing, data):]
+
+            def makefile(self, mode):
+                return os.fdopen(os.dup(self.incoming), mode)
+
+            def shutdown(self, _how):
+                if self.outgoing is not None:
+                    os.close(self.outgoing)
+                    self.outgoing = None
+
+            def close(self):
+                self.shutdown(None)
+                if self.incoming is not None:
+                    os.close(self.incoming)
+                    self.incoming = None
+
+        client_sock, server_sock = PipeSocket(client_read, client_write), PipeSocket(server_read, server_write)
+        self.addCleanup(client_sock.close)
+        self.addCleanup(server_sock.close)
+        self.addCleanup(client.close)
+
+        def send(sock, message):
+            body = json.dumps(message).encode()
+            length = bytes([len(body)]) if len(body) < 126 else b"\x7e" + struct.pack("!H", len(body))
+            sock.sendall(b"\x81" + length + body)
+
+        def receive(stream):
+            _, length = stream.read(2)
+            length &= 127
+            if length == 126:
+                length = struct.unpack("!H", stream.read(2))[0]
+            mask = stream.read(4)
+            return json.loads(bytes(b ^ mask[i % 4] for i, b in enumerate(stream.read(length))))
+
+        def app_server():
+            with server_sock.makefile("rb") as stream:
+                while (line := stream.readline()).strip():
+                    if line.lower().startswith(b"sec-websocket-key:"):
+                        key = line.split(b":", 1)[1].strip()
+                accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+                server_sock.sendall(b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+                init = receive(stream)
+                send(server_sock, {"id": init["id"], "result": {"userAgent": "fake"}})
+                send(server_sock, {"method": "test/notification", "params": {}})
+                request = receive(stream)
+                send(server_sock, {"id": request["id"], "result": {"data": ["response"]}})
+                request = receive(stream)
+                self.assertEqual(request["method"], "test/disconnect")
+                server_sock.shutdown(socket.SHUT_RDWR)
+
+        received = threading.Event()
+
+        def callback(method, _params):
+            if method == "test/notification":
+                self.assertEqual(client.request("test/nested", timeout=2)["data"], ["response"])
+                received.set()
+
+        client.add_notification_handler(callback)
+        with ThreadPoolExecutor(1) as workers:
+            server = workers.submit(app_server)
+            with patch.object(client, "ensure_daemon_running"), patch("codex_ws_client.socket.socket", return_value=client_sock):
+                self.assertEqual(client.connect()["userAgent"], "fake")
+            self.assertTrue(received.wait(3), "WebSocket reader blocked on own callback")
+            with self.assertRaises(ConnectionError):
+                client.request("test/disconnect", timeout=2)
+            server.result(timeout=2)
+        self.assertFalse(client.is_connected())
+
+    def test_01_install_switches_without_plugin_warnings(self):
+        checkout = self.root / "installer"
+        checkout.mkdir()
+        shutil.copy2(REPO_ROOT / "install.sh", checkout)
+        shutil.copytree(PLUGIN_DIR, checkout / "plugins/codex-subagent", ignore=shutil.ignore_patterns(
+            "config.json", "profiles", "__pycache__",
+        ))
+        old_agent = checkout / ".agents/agents/codex.md"
+        old_agent.parent.mkdir(parents=True)
+        old_agent.symlink_to(checkout / "old-checkout/plugins/codex-subagent/agents/codex.md")
+        global_config = self.root / "installer-global"
+        inherited = {name: value for name, value in os.environ.items() if not name.startswith("AGY_CODEX_")}
+        env = {**inherited, "AGY_CODEX_GLOBAL_CONFIG": str(global_config)}
+        for args, mode in (([], "preInvocation"), (["--mode=sdkExecutor"], "sdkExecutor"),
+                           (["--mode=preInvocation"], "preInvocation")):
+            proc = subprocess.run(["bash", "./install.sh", *args], cwd=checkout, env=env,
+                                  capture_output=True, text=True, timeout=10)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("⚠", proc.stdout + proc.stderr)
+            self.assertIn("Validation passed", proc.stdout)
+            suffix, previous = ("json", "md") if mode == "sdkExecutor" else ("md", "json")
+            for agent_dir in (checkout / ".agents/agents", global_config / "agents"):
+                self.assertTrue((agent_dir / f"codex.{suffix}").is_file())
+                self.assertFalse((agent_dir / f"codex.{previous}").exists())
+            config = json.loads((checkout / "plugins/codex-subagent/config.json").read_text())
+            self.assertEqual(config["executionMode"], mode)
+
+    def test_node_sidecar_syntax(self):
+        for path in (SIDECAR_DIR / "main.mjs", SIDECAR_DIR / "app.js"):
+            subprocess.run(["node", "--check", str(path)], check=True, timeout=5)
+
+
 class TestCodexSubagentAllPhases(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.bridge_url = ensure_bridge_daemon_running(BRIDGE_PORT)
-        cls.temp_dir = Path(tempfile.mkdtemp(prefix="agy_codex_e2e_"))
+        try:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+        except PermissionError as e:
+            raise unittest.SkipTest(f"Live phases require loopback sockets: {e}") from e
+
+        workspace = tempfile.TemporaryDirectory(prefix="agy_codex_e2e_")
+        cls.addClassCleanup(workspace.cleanup)
+        cls.temp_dir = Path(workspace.name)
         cls.test_conv_id = f"test-codex-{uuid.uuid4().hex[:10]}"
-        cls.transcript_path = cls.temp_dir / "transcript.jsonl"
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
-
-    def test_01_plugin_validation_zero_warnings(self) -> None:
-        """Verify `agy plugin validate` passes with 0 errors and 0 warnings."""
-        proc = subprocess.run(
-            ["/home/zhdi/.local/bin/agy", "plugin", "validate", str(PLUGIN_DIR)],
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-        )
-        self.assertEqual(proc.returncode, 0, f"Plugin validation failed:\n{proc.stdout}\n{proc.stderr}")
-        self.assertIn("Validation passed", proc.stdout)
-        self.assertNotIn("⚠", proc.stdout, f"Unexpected warning in plugin validate:\n{proc.stdout}")
+        cls.transcript_path = cls.temp_dir / "logs" / "transcript.jsonl"
+        cls.bridge_url = f"http://127.0.0.1:{port}"
+        cls.env = {
+            **os.environ, "AGY_CODEX_BRIDGE_PORT": str(port), "AGY_CODEX_APP_DATA_DIR": workspace.name,
+            "AGY_CODEX_CONFIG_PATH": str(PLUGIN_DIR / "config.example.json"),
+            "AGY_CODEX_PROFILE_DIR": str(cls.temp_dir / "profiles"),
+            "AGY_CODEX_WORKSPACE_ROOT": str(cls.temp_dir),
+            "AGY_CODEX_GLOBAL_AGENTS": str(cls.temp_dir / "global-agents"),
+            "ANTIGRAVITY_LS_ADDRESS": "", "ANTIGRAVITY_CSRF_TOKEN": "",
+        }
+        with sqlite3.connect(cls.temp_dir / "conversation_summaries.db") as db:
+            db.executescript("""
+                CREATE TABLE conversation_summaries (
+                  conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT, step_count INTEGER,
+                  last_modified_time TEXT, workspace_uris TEXT, status TEXT, agent_name TEXT,
+                  parent_conversation_id TEXT, nesting_depth INTEGER, not_fully_idle INTEGER,
+                  killed INTEGER, raw_summary BLOB
+                );
+                INSERT INTO conversation_summaries VALUES
+                  ('test-research', 'Research fixture', '', 0, '', '[]', 'CASCADE_RUN_STATUS_IDLE',
+                   'research', 'test-root', 1, 0, 0, NULL);
+            """)
+        proc = subprocess.Popen([sys.executable, str(BIN_DIR / "codex_bridge_daemon.py")],
+                                env=cls.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.addClassCleanup(stop_process, proc)
+        wait_until(lambda: http_get_json(f"{cls.bridge_url}/api/ready").get("status") == "ok", timeout=5)
 
     def test_02_phase1_direct_codex_daemon_websocket(self) -> None:
         """Verify direct AF_UNIX WebSocket connection & JSON-RPC handshake with codex app-server daemon."""
         client = CodexAppServerClient()
+        self.addCleanup(client.close)
         info = client.connect()
         self.assertIn("userAgent", info)
         self.assertTrue(client.is_connected())
-        loaded = client.request("thread/loaded/list", {})
-        self.assertIn("data", loaded)
-        client.close()
+        self.assertIn("data", client.request("thread/loaded/list", {}))
 
     def test_03_phase1_hook_interception_and_turn_execution(self) -> None:
         """
@@ -110,6 +530,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
         }
         proc_pass = subprocess.run(
             [sys.executable, str(hook_script)],
+            env=self.env,
             input=json.dumps(non_codex_input),
             capture_output=True,
             text=True,
@@ -152,6 +573,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 break
             time.sleep(0.4)
 
+        self.assertEqual(inspected.get("summary", {}).get("status"), "idle", inspected)
         self.assertTrue(self.transcript_path.exists(), "transcript.jsonl was not synthesized")
         tr_summary = summarize_transcript_file(self.transcript_path)
         self.assertGreaterEqual(tr_summary["steps"], 2)
@@ -185,6 +607,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
         }
         proc_intercept = subprocess.run(
             [sys.executable, str(hook_script)],
+            env=self.env,
             input=json.dumps(hook_input),
             capture_output=True,
             text=True,
@@ -215,12 +638,14 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
 
         proc_filestore = subprocess.run(
             [sys.executable, str(hook_script)],
+            env=self.env,
             input=json.dumps(hook_input),
             capture_output=True,
             text=True,
             timeout=10.0,
         )
         self.assertEqual(proc_filestore.returncode, 0)
+        self.assertNotIn("errorMessage", json.loads(proc_filestore.stdout)["injectSteps"][0])
         self.assertFalse(marker_path.exists(), "undelivered/<msg_id> marker should be unlinked by codex_hook_intercept.py")
         insp_after = http_get_json(
             f"{self.bridge_url}/api/subagent/inspect?conversationId={urllib.parse.quote(self.test_conv_id)}"
@@ -307,6 +732,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=self.env,
         )
 
         def rpc(req_id: int, method: str, params: dict) -> dict:
@@ -331,8 +757,21 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "subagent_fork",
                 "subagent_configure",
                 "subagent_handoff",
+                "subagent_define_profile",
+                "subagent_list_profiles",
             }
             self.assertEqual(tool_names, expected_tools)
+
+            profile = {
+                "name": "codex-e2e-reviewer", "description": "Reviews tests", "model": "gpt-6.2-sol",
+                "effort": "medium", "systemPrompt": "You are the e2e reviewer.", "executionMode": "sdkExecutor",
+                "sandboxMode": "read-only", "approvalPolicy": "on-request",
+            }
+            definition = rpc(8, "tools/call", {"name": "subagent_define_profile", "arguments": profile})["result"]
+            self.assertFalse(definition["isError"], definition)
+            self.assertEqual(json.loads(definition["content"][0]["text"])["profile"], profile)
+            listed = rpc(9, "tools/call", {"name": "subagent_list_profiles"})["result"]
+            self.assertEqual(json.loads(listed["content"][0]["text"])["profiles"], [profile])
 
             # Call subagent_list
             list_resp = rpc(3, "tools/call", {"name": "subagent_list", "arguments": {"includeAll": True}})
@@ -365,8 +804,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream:
                     stream.close()
-            proc.terminate()
-            proc.wait(timeout=5)
+            stop_process(proc)
 
     def test_06_phase3_unified_sidecar_ui_and_api(self) -> None:
         """
@@ -378,7 +816,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             s.bind(("127.0.0.1", 0))
             sidecar_port = s.getsockname()[1]
 
-        env = os.environ.copy()
+        env = self.env.copy()
         env["ANTIGRAVITY_SIDECAR_WEB_PORT"] = str(sidecar_port)
         # Omit ANTIGRAVITY_LS_ADDRESS / CSRF_TOKEN ONLY if testing standalone fallback, or pass fake if testing sidecar_sdk
         env.pop("ANTIGRAVITY_LS_ADDRESS", None)
@@ -408,12 +846,19 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/") as r:
                 html = r.read().decode("utf-8")
                 self.assertIn("Subagent Mission Control", html)
+                self.assertIn("Create / Manage Codex Subagent Profile (Provider)", html)
             with urllib.request.urlopen(f"{base}/styles.css") as r:
                 css = r.read().decode("utf-8")
                 self.assertIn("--accent-codex", css)
             with urllib.request.urlopen(f"{base}/app.js") as r:
                 js = r.read().decode("utf-8")
                 self.assertIn("/api/mission-control", js)
+
+            profile = http_post_json(f"{base}/api/profiles/define", {
+                "name": "codex-sidecar-test", "executionMode": "preInvocation", "systemPrompt": "Sidecar fixture",
+            })["profile"]
+            self.assertIn(profile, http_get_json(f"{base}/api/profiles")["profiles"])
+            self.assertTrue(http_post_json(f"{base}/api/profiles/delete", {"name": profile["name"]})["deleted"])
 
             # Check /api/mission-control
             mc = http_get_json(f"{base}/api/mission-control?all=true")
@@ -440,8 +885,60 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream:
                     stream.close()
-            proc.terminate()
-            proc.wait(timeout=5)
+            stop_process(proc)
+
+    def test_07_sdk_executor_real_bridge_and_idle_rpc(self):
+        idle = queue.Queue()
+
+        class LanguageServer(BaseHTTPRequestHandler):
+            def do_POST(self):
+                data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.endswith("/SignalExecutableIdle"):
+                    idle.put((data, self.headers["x-codeium-csrf-token"]))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), LanguageServer) as ls:
+            serving = threading.Thread(target=ls.serve_forever, daemon=True)
+            serving.start()
+            proc = subprocess.Popen([sys.executable, str(BIN_DIR / "codex_sdk_executor.py")],
+                                    env=self.env, cwd=self.temp_dir, stdin=subprocess.PIPE, text=True)
+            conv = "test-sdk-end-to-end"
+            try:
+                def send(message):
+                    proc.stdin.write(json.dumps(message) + "\n")
+                    proc.stdin.flush()
+
+                def snapshot():
+                    return http_get_json(f"{self.bridge_url}/api/subagent/inspect?conversationId={conv}")
+
+                send({"type": "init", "conversation_id": conv, "language_server_address": f"127.0.0.1:{ls.server_port}",
+                      "csrf_token": "fixture-csrf"})
+                send({"type": "request", "request": {"items": [{"text": "Reply with SDK_COMPLETE and no tool calls."}]}})
+                self.assertEqual(idle.get(timeout=45), ({"conversationId": conv}, "fixture-csrf"))
+                self.assertEqual(snapshot()["turnHistory"][-1]["status"], "completed")
+
+                send({"type": "request", "request": {"items": [{
+                    "text": "Use the shell to run sleep 15 in this empty test directory, then reply with DONE.",
+                }]}})
+                wait_until(lambda: snapshot()["summary"].get("activeTurnId"), timeout=15)
+                proc.send_signal(signal.SIGINT)
+                self.assertEqual(idle.get(timeout=30), ({"conversationId": conv}, "fixture-csrf"))
+                self.assertEqual(snapshot()["summary"]["status"], "interrupted")
+                self.assertIsNone(proc.poll())
+                proc.stdin.close()
+                self.assertEqual(proc.wait(timeout=5), 0)
+            finally:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+                stop_process(proc)
+                ls.shutdown()
+                serving.join(timeout=3)
 
 
 if __name__ == "__main__":

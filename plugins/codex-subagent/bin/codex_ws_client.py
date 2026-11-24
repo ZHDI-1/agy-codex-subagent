@@ -18,6 +18,7 @@ Connects directly to ~/.codex/app-server-control/app-server-control.sock
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -27,8 +28,9 @@ import struct
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("codex_ws_client")
 
@@ -61,58 +63,51 @@ class UnixWebSocketConnection:
             raise FileNotFoundError(f"Codex control socket not found: {self.sock_path} (-> {resolved})")
 
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(self.timeout)
-        s.connect(resolved)
-
         key = base64.b64encode(os.urandom(16)).decode("ascii")
-        handshake = (
-            "GET / HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "\r\n"
-        ).encode("ascii")
-        s.sendall(handshake)
+        try:
+            s.settimeout(self.timeout)
+            s.connect(resolved)
+            s.sendall((
+                "GET / HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii"))
 
-        resp = b""
-        while b"\r\n\r\n" not in resp:
-            chunk = s.recv(4096)
-            if not chunk:
-                s.close()
-                raise ConnectionError("EOF during WebSocket upgrade handshake with Codex daemon")
-            resp += chunk
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = s.recv(4096)
+                if not chunk or len(resp) > 65536:
+                    raise ConnectionError("Invalid WebSocket upgrade response from Codex")
+                resp += chunk
 
-        header_end = resp.index(b"\r\n\r\n") + 4
-        header_text = resp[:header_end].decode("latin1", errors="replace")
-        self._leftover = resp[header_end:]
-
-        first_line = header_text.splitlines()[0] if header_text else ""
-        if "101" not in first_line:
+            header, self._leftover = resp.split(b"\r\n\r\n", 1)
+            status, *fields = header.decode("latin1").split("\r\n")
+            headers = dict(field.split(":", 1) for field in fields if ":" in field)
+            headers = {name.lower(): value.strip() for name, value in headers.items()}
+            expected = base64.b64encode(hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+            ).digest()).decode("ascii")
+            if status.split()[1:2] != ["101"] or headers.get("sec-websocket-accept") != expected:
+                raise ConnectionError(f"WebSocket upgrade rejected by Codex daemon: {status}")
+            s.settimeout(None)
+        except BaseException:
             s.close()
-            raise ConnectionError(f"WebSocket upgrade rejected by Codex daemon: {first_line}")
-
-        s.settimeout(None)  # Blocking mode for background reader thread
+            raise
         self.sock = s
         self._closed = False
 
     def close(self) -> None:
         self._closed = True
-        if self.sock is not None:
+        sock, self.sock = self.sock, None
+        if sock is not None:
             try:
-                self._send_frame(0x8, b"")
-            except Exception:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
                 pass
-            try:
-                self.sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+            sock.close()
 
     def send_text(self, text: str) -> None:
         payload = text.encode("utf-8")
@@ -146,9 +141,10 @@ class UnixWebSocketConnection:
             frame = bytes(header)
 
         with self._write_lock:
-            if self.sock is None:
+            sock = self.sock
+            if self._closed or sock is None:
                 raise ConnectionError("WebSocket is closed")
-            self.sock.sendall(frame)
+            sock.sendall(frame)
 
     def _recv_exact(self, n: int) -> bytes:
         buf = bytearray()
@@ -157,9 +153,10 @@ class UnixWebSocketConnection:
             buf.extend(self._leftover[:take])
             self._leftover = self._leftover[take:]
         while len(buf) < n:
-            if self.sock is None:
+            sock = self.sock
+            if sock is None:
                 raise EOFError("Socket closed")
-            chunk = self.sock.recv(max(4096, n - len(buf)))
+            chunk = sock.recv(max(4096, n - len(buf)))
             if not chunk:
                 raise EOFError("WebSocket EOF from Codex daemon")
             need = n - len(buf)
@@ -238,7 +235,9 @@ class CodexAppServerClient:
         self._reader_thread: Optional[threading.Thread] = None
         self._next_id = 1
         self._id_lock = threading.Lock()
-        self._pending: Dict[int | str, "queue.Queue[Dict[str, Any]]"] = {}
+        self._pending: Dict[int | str, tuple[UnixWebSocketConnection, queue.Queue]] = {}
+        self._callbacks: queue.SimpleQueue = queue.SimpleQueue()
+        self._callback_worker: Optional[threading.Thread] = None
         self._pending_lock = threading.Lock()
         self._conn_lock = threading.RLock()
         self._initialized = False
@@ -251,7 +250,7 @@ class CodexAppServerClient:
         # If it returns None, the handler is holding the request asynchronously (e.g., UI approval)
         # and will call client.respond_to_server_request(req_id, result) later.
         self._server_request_handler: Optional[
-            Callable[[int | str, str, Dict[str, Any]], Optional[Dict[str, Any]]]
+            Callable[[int | str, str, Dict[str, Any], Callable[..., None]], Optional[Dict[str, Any]]]
         ] = None
 
     def add_notification_handler(self, handler: Callable[[str, Dict[str, Any]], None]) -> None:
@@ -259,55 +258,45 @@ class CodexAppServerClient:
 
     def set_server_request_handler(
         self,
-        handler: Callable[[int | str, str, Dict[str, Any]], Optional[Dict[str, Any]]],
+        handler: Callable[[int | str, str, Dict[str, Any], Callable[..., None]], Optional[Dict[str, Any]]],
     ) -> None:
         self._server_request_handler = handler
 
     def is_connected(self) -> bool:
-        return self._ws is not None and not self._ws._closed and self._initialized
+        ws = self._ws
+        return ws is not None and not ws._closed and self._initialized
+
+    @property
+    def connection(self) -> Optional[UnixWebSocketConnection]:
+        return self._ws if self.is_connected() else None
 
     def ensure_daemon_running(self) -> None:
-        """Verifies control socket exists and is reachable; starts daemon if needed."""
-        resolved = os.path.realpath(str(self.sock_path))
-        if os.path.exists(resolved):
+        """Verify the control socket is reachable, starting Codex if needed."""
+        def available() -> bool:
             try:
-                test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                test_sock.settimeout(2.0)
-                test_sock.connect(resolved)
-                test_sock.close()
-                return
-            except Exception as e:
-                logger.warning("Existing Codex control socket not connectable (%s), attempting restart...", e)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(1.0)
+                    probe.connect(os.path.realpath(self.sock_path))
+                return True
+            except OSError:
+                return False
 
+        if available():
+            return
         if not self.auto_start_daemon:
-            raise ConnectionError(f"Codex app-server daemon socket is not running at {self.sock_path}")
-
-        # Try launching codex app-server daemon via codex CLI
-        logger.info("Auto-starting codex app-server daemon...")
-        try:
-            subprocess.Popen(
-                ["codex", "app-server", "--remote-control", "--listen", "unix://", "--managed-daemon"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            raise RuntimeError("`codex` binary not found in PATH")
-
-        deadline = time.time() + 10.0
-        while time.time() < deadline:
-            resolved = os.path.realpath(str(self.sock_path))
-            if os.path.exists(resolved):
-                try:
-                    test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    test_sock.settimeout(1.0)
-                    test_sock.connect(resolved)
-                    test_sock.close()
-                    return
-                except Exception:
-                    pass
+            raise ConnectionError(f"Codex app-server socket is unavailable at {self.sock_path}")
+        process = subprocess.Popen(
+            ["codex", "app-server", "--remote-control", "--listen", "unix://", "--managed-daemon"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        threading.Thread(target=process.wait, name="codex-daemon-reaper", daemon=True).start()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if available():
+                return
             time.sleep(0.2)
-        raise TimeoutError(f"Timed out waiting for codex app-server daemon socket at {self.sock_path}")
+        raise TimeoutError(f"Timed out waiting for Codex app-server socket at {self.sock_path}")
 
     def connect(self) -> Dict[str, Any]:
         with self._conn_lock:
@@ -319,39 +308,43 @@ class CodexAppServerClient:
             ws.connect()
             self._ws = ws
             self._initialized = False
-
+            if self._callback_worker is None:
+                self._callback_worker = threading.Thread(
+                    target=self._run_callbacks, args=(self._callbacks,),
+                    name="codex-ws-callbacks", daemon=True,
+                )
+                self._callback_worker.start()
             self._reader_thread = threading.Thread(
-                target=self._reader_loop,
-                name="codex-ws-reader",
-                daemon=True,
+                target=self._reader_loop, args=(ws, self._callbacks), name="codex-ws-reader", daemon=True,
             )
             self._reader_thread.start()
-
-            init_res = self._raw_request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": self.client_name,
-                        "title": "Antigravity Codex Subagent Bridge",
-                        "version": self.client_version,
+            try:
+                init_res = self._raw_request(
+                    ws, "initialize",
+                    {
+                        "clientInfo": {"name": self.client_name, "title": "Antigravity Codex Subagent Bridge",
+                                       "version": self.client_version},
+                        "capabilities": {"experimentalApi": True},
                     },
-                    "capabilities": {
-                        "experimentalApi": True,
-                    },
-                },
-                timeout=10.0,
-            )
-            self.user_agent = init_res.get("userAgent", "")
-            self._initialized = True
+                    timeout=10.0,
+                )
+                self.user_agent = init_res.get("userAgent", "")
+                self._initialized = True
+            except BaseException:
+                ws.close()
+                raise
             logger.info("Connected to Codex App-Server Daemon (%s)", self.user_agent)
             return init_res
 
     def close(self) -> None:
         with self._conn_lock:
             self._initialized = False
-            if self._ws is not None:
-                self._ws.close()
-                self._ws = None
+            ws, self._ws = self._ws, None
+            if ws is not None:
+                ws.close()
+            self._callbacks.put(None)
+            self._callbacks = queue.SimpleQueue()
+            self._callback_worker = None
 
     def _next_request_id(self) -> int:
         with self._id_lock:
@@ -359,73 +352,80 @@ class CodexAppServerClient:
             self._next_id += 1
             return rid
 
-    def _raw_request(self, method: str, params: Any = None, timeout: float = 60.0) -> Any:
-        if self._ws is None or self._ws._closed:
-            raise ConnectionError("WebSocket is not connected")
-
+    def _raw_request(self, ws: UnixWebSocketConnection, method: str, params: Any = None, timeout: float = 60.0) -> Any:
         req_id = self._next_request_id()
-        q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1)
+        reply: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
-            self._pending[req_id] = q
+            if ws._closed:
+                raise ConnectionError("WebSocket is not connected")
+            self._pending[req_id] = (ws, reply)
 
-        msg: Dict[str, Any] = {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "method": method,
-        }
+        msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
         if params is not None:
             msg["params"] = params
 
         try:
-            self._ws.send_text(json.dumps(msg))
-            resp = q.get(timeout=timeout)
+            ws.send_text(json.dumps(msg))
+            response = reply.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError(f"Codex RPC method '{method}' (id={req_id}) timed out after {timeout}s")
+            raise TimeoutError(f"Codex RPC '{method}' timed out after {timeout}s") from None
         finally:
             with self._pending_lock:
                 self._pending.pop(req_id, None)
 
-        if "error" in resp and resp["error"] is not None:
-            err = resp["error"]
-            raise CodexRpcError(
-                code=err.get("code", -1),
-                message=err.get("message", "Unknown RPC error"),
-                data=err.get("data"),
-            )
-        return resp.get("result")
+        if isinstance(response, Exception):
+            raise response
+        if response.get("error") is not None:
+            err = response["error"]
+            raise CodexRpcError(err.get("code", -1), err.get("message", "Unknown RPC error"), err.get("data"))
+        return response.get("result")
 
     def request(self, method: str, params: Any = None, timeout: float = 60.0) -> Any:
-        """Sends a JSON-RPC request, auto-connecting/reconnecting if necessary."""
-        if not self.is_connected():
-            self.connect()
-        try:
-            return self._raw_request(method, params, timeout=timeout)
-        except (ConnectionError, EOFError, BrokenPipeError):
-            logger.warning("Connection lost during '%s'; reconnecting once...", method)
-            self.close()
-            self.connect()
-            return self._raw_request(method, params, timeout=timeout)
+        """Reconnect before sending. A lost response cannot safely be replayed."""
+        self.connect()
+        ws = self.connection
+        if ws is None:
+            raise ConnectionError("Codex closed the connection before the request")
+        return self._raw_request(ws, method, params, timeout)
 
     def respond_to_server_request(
         self,
         req_id: int | str,
         result: Optional[Dict[str, Any]] = None,
         error: Optional[Dict[str, Any]] = None,
+        *,
+        connection: Optional[UnixWebSocketConnection] = None,
     ) -> None:
-        """Sends a JSON-RPC 2.0 response back to a ServerRequest initiated by the daemon."""
-        if self._ws is None or self._ws._closed:
+        ws = connection or self.connection
+        if ws is None:
             raise ConnectionError("WebSocket is not connected")
         payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id}
         if error is not None:
             payload["error"] = error
         else:
             payload["result"] = result if result is not None else {}
-        self._ws.send_text(json.dumps(payload))
+        ws.send_text(json.dumps(payload))
 
-    def _reader_loop(self) -> None:
-        ws = self._ws
-        if ws is None:
+    @staticmethod
+    def _run_callbacks(callbacks: queue.SimpleQueue) -> None:
+        while (work := callbacks.get()) is not None:
+            fn, args = work
+            try:
+                fn(*args)
+            except Exception:
+                logger.exception("Error in Codex callback")
+
+    def _deliver_notification(self, ws: UnixWebSocketConnection, method: str, params: Dict[str, Any]) -> None:
+        # An old reader can drain its last frames while a new connection initializes.
+        if ws is not self._ws and method != "bridge/disconnected":
             return
+        for handler in list(self._notification_handlers):
+            try:
+                handler(method, params)
+            except Exception:
+                logger.exception("Error in notification handler for %s", method)
+
+    def _reader_loop(self, ws: UnixWebSocketConnection, callbacks: queue.SimpleQueue) -> None:
         try:
             while not ws._closed:
                 raw = ws.recv_message()
@@ -433,98 +433,81 @@ class CodexAppServerClient:
                     break
                 try:
                     msg = json.loads(raw)
-                except Exception as e:
-                    logger.warning("Failed to parse JSON from Codex daemon: %s", e)
+                except ValueError:
+                    logger.warning("Invalid JSON from Codex daemon")
                     continue
-
                 if not isinstance(msg, dict):
                     continue
 
-                has_id = "id" in msg and msg["id"] is not None
-                has_method = "method" in msg and msg["method"] is not None
-
-                if has_id and not has_method:
-                    # Response to our ClientRequest
-                    req_id = msg["id"]
+                req_id = msg.get("id")
+                method = msg.get("method")
+                params = msg.get("params") or {}
+                if req_id is not None and method is None:
                     with self._pending_lock:
-                        q = self._pending.get(req_id)
-                    if q is not None:
+                        pending = self._pending.get(req_id)
+                        if pending and pending[0] is ws:
+                            try:
+                                pending[1].put_nowait(msg)
+                            except queue.Full:
+                                pass
+                elif method is not None and req_id is None:
+                    callbacks.put((self._deliver_notification, (ws, method, params)))
+                elif method is not None:
+                    callbacks.put((self._schedule_server_request, (ws, req_id, method, params)))
+        except (EOFError, OSError) as e:
+            if not ws._closed:
+                logger.info("Codex WebSocket reader disconnected: %s", e)
+        finally:
+            ws.close()
+            with self._pending_lock:
+                for connection, reply in self._pending.values():
+                    if connection is ws:
                         try:
-                            q.put_nowait(msg)
+                            reply.put_nowait(ConnectionError("Connection closed by Codex app-server"))
                         except queue.Full:
                             pass
-                elif has_method and not has_id:
-                    # ServerNotification
-                    method = str(msg["method"])
-                    params = msg.get("params") or {}
-                    for handler in list(self._notification_handlers):
-                        try:
-                            handler(method, params)
-                        except Exception as e:
-                            logger.exception("Error in notification handler for %s: %s", method, e)
-                elif has_method and has_id:
-                    # ServerRequest (e.g. requestApproval, item/tool/call)
-                    req_id = msg["id"]
-                    method = str(msg["method"])
-                    params = msg.get("params") or {}
-                    threading.Thread(
-                        target=self._handle_server_request,
-                        args=(req_id, method, params),
-                        daemon=True,
-                    ).start()
-        except EOFError:
-            logger.info("Codex WebSocket EOF reached")
-        except Exception as e:
-            if not ws._closed:
-                logger.warning("Codex WebSocket reader loop exited: %s", e)
-        finally:
-            self._initialized = False
-            # Wake up any pending callers with a connection error
-            with self._pending_lock:
-                for rid, q in list(self._pending.items()):
-                    try:
-                        q.put_nowait(
-                            {
-                                "id": rid,
-                                "error": {"code": -32000, "message": "Connection closed by Codex daemon"},
-                            }
-                        )
-                    except Exception:
-                        pass
+            callbacks.put((self._deliver_notification, (ws, "bridge/disconnected", {"connection": ws})))
 
-    def _handle_server_request(self, req_id: int | str, method: str, params: Dict[str, Any]) -> None:
-        if self._server_request_handler is not None:
-            try:
-                res = self._server_request_handler(req_id, method, params)
-                if res is not None:
-                    self.respond_to_server_request(req_id, result=res)
-                return
-            except Exception as e:
-                logger.exception("Server request handler failed for %s: %s", method, e)
-                self.respond_to_server_request(
-                    req_id,
-                    error={"code": -32603, "message": str(e)},
-                )
-                return
-
-        # Default safe fallback if no custom handler is registered
-        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-            self.respond_to_server_request(req_id, result={"decision": "accept"})
-        elif method == "item/permissions/requestApproval":
-            self.respond_to_server_request(
-                req_id,
-                result={"permissions": params.get("permissions", {}), "scope": "turn"},
-            )
-        elif method == "item/tool/call":
-            self.respond_to_server_request(
-                req_id,
-                result={
-                    "success": False,
-                    "contentItems": [{"type": "inputText", "text": "Dynamic tool handler not configured"}],
-                },
-            )
+    def _schedule_server_request(self, ws: UnixWebSocketConnection, req_id: int | str,
+                                 method: str, params: Dict[str, Any]) -> None:
+        if ws is not self._ws or ws._closed:
+            return
+        if method == "item/tool/call":
+            threading.Thread(
+                target=self._handle_server_request, args=(ws, req_id, method, params),
+                name="codex-dynamic-tool", daemon=True,
+            ).start()
         else:
-            self.respond_to_server_request(req_id, result={})
+            self._handle_server_request(ws, req_id, method, params)
+
+    def _handle_server_request(self, ws: UnixWebSocketConnection, req_id: int | str,
+                               method: str, params: Dict[str, Any]) -> None:
+        def reply(result=None, error=None):
+            self.respond_to_server_request(req_id, result=result, error=error, connection=ws)
+
+        try:
+            if self._server_request_handler is not None:
+                result = self._server_request_handler(req_id, method, params, reply)
+            elif method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+                result = {"decision": "decline"}
+            elif method == "item/permissions/requestApproval":
+                result = {"permissions": {}, "scope": "turn"}
+            elif method == "item/tool/call":
+                result = {"success": False, "contentItems": [
+                    {"type": "inputText", "text": "Dynamic tool handler not configured"}
+                ]}
+            else:
+                result = {}
+            if result is not None:
+                reply(result=result)
+        except (OSError, ConnectionError):
+            logger.info("Connection closed responding to Codex request %s", req_id)
+        except Exception as e:
+            logger.exception("Server request handler failed for %s", method)
+            try:
+                reply(error={"code": -32603, "message": str(e)})
+            except OSError:
+                pass
 
     # -------------------------------------------------------------------------
     # High-level Codex App-Server v2 Convenience Methods
@@ -534,6 +517,7 @@ class CodexAppServerClient:
         self,
         cwd: Optional[str] = None,
         model: Optional[str] = None,
+        effort: Optional[str] = None,
         approval_policy: str = "never",
         sandbox: str = "workspace-write",
         base_instructions: Optional[str] = None,
@@ -545,14 +529,15 @@ class CodexAppServerClient:
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
             "ephemeral": ephemeral,
-            "experimentalRawEvents": False,
-            "persistExtendedHistory": True,
+            "historyMode": "paginated",
         }
         if cwd:
             params["cwd"] = cwd
             params["runtimeWorkspaceRoots"] = [cwd]
         if model:
             params["model"] = model
+        if effort:
+            params["config"] = {"model_reasoning_effort": effort}
         if base_instructions:
             params["baseInstructions"] = base_instructions
         if developer_instructions:
@@ -562,7 +547,7 @@ class CodexAppServerClient:
         return self.request("thread/start", params)
 
     def thread_resume(self, thread_id: str, cwd: Optional[str] = None) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"threadId": thread_id, "persistExtendedHistory": True}
+        params: Dict[str, Any] = {"threadId": thread_id, "excludeTurns": True}
         if cwd:
             params["cwd"] = cwd
         return self.request("thread/resume", params)
@@ -574,7 +559,7 @@ class CodexAppServerClient:
         before_turn_id: Optional[str] = None,
         cwd: Optional[str] = None,
     ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"threadId": thread_id, "persistExtendedHistory": True}
+        params: Dict[str, Any] = {"threadId": thread_id, "excludeTurns": True}
         if last_turn_id:
             params["lastTurnId"] = last_turn_id
         if before_turn_id:
@@ -600,6 +585,7 @@ class CodexAppServerClient:
             "thread/queue/add",
             {
                 "threadId": thread_id,
+                "clientUserMessageId": str(uuid.uuid4()),
                 "input": [{"type": "text", "text": text, "text_elements": []}],
             },
         )
@@ -640,7 +626,7 @@ class CodexAppServerClient:
             "input": [{"type": "text", "text": steer_text, "text_elements": []}],
         }
         if additional_context:
-            params["additionalContext"] = additional_context
+            params["additionalContext"] = {"agy": {"kind": "untrusted", "value": additional_context}}
         return self.request("turn/steer", params)
 
     def turn_interrupt(self, thread_id: str, turn_id: str) -> Dict[str, Any]:

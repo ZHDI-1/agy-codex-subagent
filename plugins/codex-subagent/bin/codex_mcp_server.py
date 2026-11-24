@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,7 @@ from typing import Any, Dict, List, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from codex_profiles import APPROVAL_POLICIES, EFFORTS, EXECUTION_MODES, SANDBOX_MODES
 from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running
 
 
@@ -55,11 +58,35 @@ def bridge_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         with urllib.request.urlopen(req, timeout=30.0) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Bridge HTTP {e.code}: {err_body}")
+        with e:
+            err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Bridge HTTP {e.code}: {err_body}") from e
 
 
 MCP_TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "subagent_define_profile",
+        "description": "Create or update a Codex profile and register its native Antigravity subagent type.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"},
+                "description": {"type": "string"},
+                "model": {"type": "string"},
+                "effort": {"type": "string", "enum": EFFORTS},
+                "systemPrompt": {"type": "string"},
+                "executionMode": {"type": "string", "enum": EXECUTION_MODES},
+                "sandboxMode": {"type": "string", "enum": SANDBOX_MODES},
+                "approvalPolicy": {"type": "string", "enum": APPROVAL_POLICIES},
+            },
+        },
+    },
+    {
+        "name": "subagent_list_profiles",
+        "description": "List saved Codex profiles and defaults for new profiles.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
     {
         "name": "subagent_list",
         "description": (
@@ -279,6 +306,10 @@ MCP_TOOLS: List[Dict[str, Any]] = [
 
 
 def handle_tool_call(name: str, args: Dict[str, Any]) -> Any:
+    if name == "subagent_define_profile":
+        return bridge_post("/api/profiles/define", args)
+    if name == "subagent_list_profiles":
+        return bridge_get("/api/profiles")
     if name == "subagent_list":
         return bridge_get(
             "/api/subagents",
@@ -351,99 +382,60 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Any:
     raise ValueError(f"Unknown tool: {name}")
 
 
+stdout_lock = threading.Lock()
+
+
 def send_mcp_response(msg: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    with stdout_lock:
+        sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def run_tool(req_id: str | int, params: Dict[str, Any]) -> None:
+    try:
+        result = handle_tool_call(params.get("name", ""), params.get("arguments") or {})
+        message = json.dumps(result, indent=2, ensure_ascii=False)
+        is_error = False
+    except Exception as e:
+        message, is_error = f"Error: {e}", True
+    send_mcp_response({
+        "jsonrpc": "2.0", "id": req_id,
+        "result": {"content": [{"type": "text", "text": message}], "isError": is_error},
+    })
 
 
 def main() -> None:
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="codex-mcp-tool") as workers:
+        for line in sys.stdin:
+            try:
+                req = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(req, dict) or req.get("id") is None:
+                continue
 
-        if not isinstance(req, dict):
-            continue
-
-        req_id = req.get("id")
-        method = req.get("method", "")
-        params = req.get("params") or {}
-
-        # Notifications (no id)
-        if req_id is None:
-            continue
-
-        try:
+            req_id, method, params = req["id"], req.get("method"), req.get("params") or {}
+            if not isinstance(params, dict):
+                send_mcp_response({"jsonrpc": "2.0", "id": req_id,
+                                   "error": {"code": -32602, "message": "Invalid params"}})
+                continue
+            response: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id}
             if method == "initialize":
-                client_proto = params.get("protocolVersion") or "2024-11-05"
-                send_mcp_response(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "protocolVersion": client_proto,
-                            "capabilities": {
-                                "tools": {"listChanged": False},
-                            },
-                            "serverInfo": {
-                                "name": "codex-subagent-control",
-                                "version": "1.0.0",
-                            },
-                        },
-                    }
-                )
-            elif method == "ping":
-                send_mcp_response({"jsonrpc": "2.0", "id": req_id, "result": {}})
-            elif method == "tools/list":
-                send_mcp_response(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"tools": MCP_TOOLS},
-                    }
-                )
-            elif method == "tools/call":
-                tool_name = params.get("name", "")
-                tool_args = params.get("arguments") or {}
-                res_obj = handle_tool_call(tool_name, tool_args)
-                send_mcp_response(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": json.dumps(res_obj, indent=2, ensure_ascii=False),
-                                }
-                            ],
-                            "isError": False,
-                        },
-                    }
-                )
-            else:
-                send_mcp_response(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {"code": -32601, "message": f"Method not found: {method}"},
-                    }
-                )
-        except Exception as e:
-            send_mcp_response(
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": [{"type": "text", "text": f"Error: {e}"}],
-                        "isError": True,
-                    },
+                response["result"] = {
+                    "protocolVersion": params.get("protocolVersion") or "2024-11-05",
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "codex-subagent-control", "version": "1.0.0"},
                 }
-            )
+            elif method == "ping":
+                response["result"] = {}
+            elif method == "tools/list":
+                response["result"] = {"tools": MCP_TOOLS}
+            elif method == "tools/call":
+                workers.submit(run_tool, req_id, params)
+                continue
+            else:
+                response["error"] = {"code": -32601, "message": f"Method not found: {method}"}
+            send_mcp_response(response)
 
 
 if __name__ == "__main__":

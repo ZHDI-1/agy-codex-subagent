@@ -1,47 +1,22 @@
 #!/usr/bin/env python3
-"""
-Antigravity PreInvocation Lifecycle Hook for `codex-subagent`.
-
-When `invoke_subagent(TypeName="codex", ...)` or `send_message(Recipient=<codex_subagent_id>, ...)`
-triggers a turn in the `codex` subagent conversation:
-1. Fast-checks whether the conversation is a `codex` subagent via:
-   - `payload.get("agentName") == "codex"` (injected directly by Antigravity `HookArgsCommon`)
-   - Bridge state file (`codex_subagent_state.json`)
-   - SQLite `conversation_summaries.db`
-2. If it is NOT a `codex` subagent (e.g., main conversation or Gemini `self`/`research` subagent),
-   outputs `{}` immediately in < 2ms so native Gemini execution proceeds untouched.
-3. If it IS a `codex` subagent:
-   - Drains undelivered messages directly from Antigravity's `messages.FileStore`:
-     `<appDataDir>/brain/<conversationId>/.system_generated/messages/undelivered/<msg_id>`
-     and `<appDataDir>/brain/<conversationId>/.system_generated/messages/<msg_id>.json`,
-     extracting the exact `content`, `sender` (`parentConversationId`), and `Role` (from
-     `sourceMetadata.tool.toolCall.argumentsJson`), and removes the `undelivered/<msg_id>`
-     marker file so `messages.FileStore` marks the message delivered!
-   - Falls back to `lastUserInput` or `transcript.jsonl` if no undelivered message file exists.
-   - Dispatches to `codex_bridge_daemon.py` (`/api/dispatch`), which executes `turn/start` (if idle)
-     or `turn/steer` (if a turn is actively running on the Codex App-Server Daemon!).
-   - Calls `LanguageServerService/CancelCascadeInvocation` (`notifyParent: False`) and outputs
-     `{"terminationBehavior": "terminate"}` so Antigravity's `ordinaryExecutor` stops immediately
-     before making any Gemini LLM call (0 Gemini tokens consumed!).
-"""
+"""Route Codex-backed Markdown agents from Antigravity's PreInvocation hook."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
-import subprocess
 import sys
 import urllib.request
+from contextlib import closing
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+from typing import Any
 
 from codex_bridge_daemon import BRIDGE_HOST, BRIDGE_PORT, ensure_bridge_daemon_running, find_app_data_dirs
-
+from codex_profiles import active_sdk_definition, live_sdk_instance, load_config, load_profiles, read_object
 
 SYSTEM_MSG_RE = re.compile(
     r"\[Message\]\s+timestamp=\S+\s+sender=([0-9a-fA-F-]{8,})\s+priority=\S+\s+content=(.*?)\s*(?:</SYSTEM_MESSAGE>|$)",
@@ -49,394 +24,271 @@ SYSTEM_MSG_RE = re.compile(
 )
 
 
-def hydrate_ls_env_from_state() -> Tuple[str, str, str]:
-    ls_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
-    csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
-    exe = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE") or "/home/zhdi/.local/bin/agy"
-
-    if not ls_addr or not csrf:
-        for app_dir in find_app_data_dirs():
-            state_path = app_dir / "codex_subagent_state.json"
-            if state_path.exists():
-                try:
-                    st = json.loads(state_path.read_text(encoding="utf-8"))
-                    if not ls_addr and st.get("lsAddress"):
-                        ls_addr = str(st["lsAddress"])
-                        os.environ["ANTIGRAVITY_LS_ADDRESS"] = ls_addr
-                    if not csrf and st.get("csrfToken"):
-                        csrf = str(st["csrfToken"])
-                        os.environ["ANTIGRAVITY_CSRF_TOKEN"] = csrf
-                    if ls_addr and csrf:
-                        break
-                except Exception:
-                    pass
-    return (ls_addr, csrf, exe)
-
-
-def normalize_compact_transcript_path(raw_path: str, conv_id: str) -> str:
+def normalize_transcript_path(raw_path: str, conversation: str) -> str:
     if raw_path:
-        p = Path(raw_path)
-        if p.name == "transcript_full.jsonl":
-            return str(p.parent / "transcript.jsonl")
-        return str(p)
-    app_dirs = find_app_data_dirs()
-    return str(app_dirs[0] / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl")
+        path = Path(raw_path)
+        return str(path.with_name("transcript.jsonl") if path.name == "transcript_full.jsonl" else path)
+    return str(find_app_data_dirs()[0] / "brain" / conversation / ".system_generated/logs/transcript.jsonl")
 
 
-def drain_undelivered_filestore_messages(conv_id: str, raw_transcript_path: str = "") -> Tuple[str, str, str]:
-    """
-    Drains undelivered messages from Antigravity's `messages.FileStore`:
-      <appDataDir>/brain/<conv_id>/.system_generated/messages/undelivered/<msg_id>
-      <appDataDir>/brain/<conv_id>/.system_generated/messages/<msg_id>.json
-    Returns (combined_content, sender_parent_id, role).
-    """
-    if not conv_id:
-        return ("", "", "")
+def message_dirs(conversation: str, transcript: str = "") -> list[Path]:
+    dirs = [app / "brain" / conversation / ".system_generated/messages" for app in find_app_data_dirs()]
+    if transcript:
+        path = Path(transcript)
+        dirs = [path.parent.parent / "messages", path.parent / "messages", *dirs]
+    return list(dict.fromkeys(dirs))
 
-    records: List[Tuple[str, str, str, str, Path]] = []  # (timestamp, content, sender, role, marker_path)
-    msg_dirs: List[Path] = []
-    if raw_transcript_path:
-        tp = Path(raw_transcript_path)
-        for cand in (tp.parent.parent / "messages", tp.parent / "messages"):
-            if cand not in msg_dirs:
-                msg_dirs.append(cand)
-    for app_dir in find_app_data_dirs():
-        cand = app_dir / "brain" / conv_id / ".system_generated" / "messages"
-        if cand not in msg_dirs:
-            msg_dirs.append(cand)
 
-    for msg_dir in msg_dirs:
-        undeliv_dir = msg_dir / "undelivered"
-        if not undeliv_dir.is_dir():
-            continue
-        for marker in undeliv_dir.iterdir():
-            if not marker.is_file():
-                continue
-            msg_json_path = msg_dir / f"{marker.name}.json"
-            if not msg_json_path.is_file():
-                continue
+def sender_id(message: dict[str, Any]) -> str:
+    sender = message.get("sender")
+    return str((sender.get("conversationId") if isinstance(sender, dict) else sender) or "")
+
+
+def invoke_arguments(msg: dict[str, Any]) -> dict[str, Any]:
+    metadata = (msg.get("sourceMetadata") or {}).get("tool") or {}
+    tool = metadata.get("toolCall") or {}
+    if tool.get("name") == "invoke_subagent":
+        args = json.loads(tool.get("argumentsJson") or "{}")
+        return args if isinstance(args, dict) else {}
+    return {}
+
+
+def pending_messages(conversation: str, transcript: str = "") -> tuple[str, str, str, list[Path]]:
+    pending = []
+    for directory in message_dirs(conversation, transcript):
+        for marker in (directory / "undelivered").glob("*"):
             try:
-                msg_obj = json.loads(msg_json_path.read_text(encoding="utf-8", errors="replace"))
-                ts = str(msg_obj.get("timestamp") or "")
-                content = str(msg_obj.get("content") or "").strip()
-                sender = str(msg_obj.get("sender") or "").strip()
-                role = ""
-                tool_call = ((msg_obj.get("sourceMetadata") or {}).get("tool") or {}).get("toolCall") or {}
-                if tool_call.get("name") == "invoke_subagent" and tool_call.get("argumentsJson"):
-                    try:
-                        t_args = json.loads(tool_call["argumentsJson"])
-                        role = str(t_args.get("Role") or "")
-                        if not content and t_args.get("Prompt"):
-                            content = str(t_args["Prompt"]).strip()
-                    except Exception:
-                        pass
-                records.append((ts, content, sender, role, marker))
-            except Exception:
+                if not marker.is_file():
+                    continue
+                msg = read_object(directory / f"{marker.name}.json")
+                args = invoke_arguments(msg)
+                content = str(msg.get("content") or args.get("Prompt") or "").strip()
+                if content:
+                    pending.append((str(msg.get("timestamp") or msg.get("createdAt") or ""), marker, content,
+                                    sender_id(msg), str(args.get("Role") or "")))
+            except (OSError, ValueError, TypeError, AttributeError):
                 continue
+    pending.sort()
+    return (
+        "\n\n".join(item[2] for item in pending),
+        next((item[3] for item in pending if item[3]), ""),
+        next((item[4] for item in pending if item[4]), ""),
+        [item[1] for item in pending],
+    )
 
-    if not records:
-        return ("", "", "")
 
-    records.sort(key=lambda r: r[0])
-    contents: List[str] = []
-    sender_id = ""
-    role_found = ""
-    for _, content, sender, role, marker in records:
-        if content:
-            contents.append(content)
-        if sender and not sender_id:
-            sender_id = sender
-        if role and not role_found:
-            role_found = role
+def acknowledge_messages(markers: list[Path]) -> None:
+    for marker in markers:
         try:
             marker.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    return ("\n\n".join(contents), sender_id, role_found)
+        except OSError as e:
+            print(f"codex subagent: could not acknowledge FileStore message {marker.name}: {e}", file=sys.stderr)
 
 
-def extract_latest_input_from_transcripts(raw_transcript_path: str, conv_id: str) -> Tuple[str, str]:
-    candidates: List[Path] = []
-    if raw_transcript_path:
-        p = Path(raw_transcript_path)
-        candidates.append(p.parent / "transcript.jsonl")
-        if p not in candidates:
-            candidates.append(p)
-    for app_dir in find_app_data_dirs():
-        log_dir = app_dir / "brain" / conv_id / ".system_generated" / "logs"
-        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
-            fp = log_dir / fname
-            if fp not in candidates:
-                candidates.append(fp)
+def input_id(sources: list[Path | str]) -> str:
+    return hashlib.sha256("\0".join(str(source) for source in sources).encode()).hexdigest()
 
-    for fp in candidates:
-        if not fp.exists():
-            continue
+
+def transcript_prompt(transcript: str, conversation: str) -> tuple[str, str, str]:
+    candidates = [Path(normalize_transcript_path(transcript, conversation))]
+    if transcript:
+        candidates.append(Path(transcript))
+    for app in find_app_data_dirs():
+        folder = app / "brain" / conversation / ".system_generated/logs"
+        candidates.extend((folder / "transcript.jsonl", folder / "transcript_full.jsonl"))
+    for path in dict.fromkeys(candidates):
         try:
-            lines = [ln for ln in fp.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
-            for line in reversed(lines):
-                try:
-                    step = json.loads(line)
-                except Exception:
-                    continue
-                s_type = step.get("type", "")
-                content = str(step.get("content") or "").strip()
-                if s_type == "USER_INPUT" and content:
-                    return (content, "")
-                if s_type == "SYSTEM_MESSAGE" and content:
-                    m = SYSTEM_MSG_RE.search(content)
-                    if m:
-                        msg_body = m.group(2).strip()
-                        sender_id = m.group(1).strip()
-                        if msg_body:
-                            return (msg_body, sender_id)
-                if s_type == "PLANNER_RESPONSE":
-                    break
-        except Exception:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
             continue
-    return ("", "")
-
-
-def check_is_codex_subagent(payload: Dict[str, Any], conversation_id: str, exe: str) -> Tuple[bool, str, str, str]:
-    """
-    Returns (is_codex, parent_conversation_id, role, initial_prompt).
-    """
-    if not conversation_id:
-        return (False, "", "", "")
-
-    # 0. Direct check from HookArgsCommon payload fields (`agentName`, `parentConversationId`)
-    payload_agent = str(payload.get("agentName") or "").strip()
-    payload_parent = str(payload.get("parentConversationId") or "").strip()
-    if payload_agent == "codex":
-        return (True, payload_parent, "", "")
-    if payload_agent in ("research", "self", "image-generator"):
-        return (False, payload_parent, "", "")
-
-    app_dirs = find_app_data_dirs()
-
-    # 1. Check Bridge state file
-    for app_dir in app_dirs:
-        state_path = app_dir / "codex_subagent_state.json"
-        if state_path.exists():
+        for line in reversed(lines):
             try:
-                st = json.loads(state_path.read_text(encoding="utf-8"))
-                sess = (st.get("sessions") or {}).get(conversation_id)
-                if isinstance(sess, dict):
-                    return (
-                        True,
-                        str(sess.get("parentConversationId") or payload_parent),
-                        str(sess.get("role") or "Codex Subagent"),
-                        "",
-                    )
-            except Exception:
-                pass
+                step = json.loads(line)
+            except ValueError:
+                continue
+            content = str(step.get("content") or "").strip()
+            source = input_id([path, line])
+            if step.get("type") == "USER_INPUT" and content and step.get("source") != "USER_EXPLICIT":
+                return content, "", source
+            if step.get("type") == "SYSTEM_MESSAGE" and (match := SYSTEM_MSG_RE.search(content)):
+                return match[2].strip(), match[1], source
+            if step.get("type") == "PLANNER_RESPONSE":
+                break
+    return "", "", ""
 
-    # 2. Check SQLite conversation_summaries.db
-    for app_dir in app_dirs:
-        db_path = app_dir / "conversation_summaries.db"
-        if not db_path.exists():
+
+def get_route(payload: dict[str, Any], conversation: str) -> tuple[str, str, str, str, dict, dict]:
+    """Resolve the agent, parent, role, initial prompt and persisted state."""
+    name = payload.get("agentName") or ""
+    parent = payload.get("parentConversationId") or ""
+    if name in ("self", "research", "image-generator"):
+        return "", parent, "", "", {}, {}
+    role = payload.get("role") or ""
+    profiles = load_profiles()
+    saved = {}
+    session = {}
+    for app in find_app_data_dirs():
+        try:
+            saved = read_object(app / "codex_subagent_state.json")
+            profiles.update(saved.get("profiles", {}))
+            session = saved.get("sessions", {}).get(conversation, {})
+            if session:
+                break
+        except (OSError, ValueError):
+            continue
+    if session:
+        return (session.get("agentName") or "codex", parent or session.get("parentConversationId") or "",
+                role or session.get("role") or "", "", session, saved)
+    names = {"codex", *profiles}
+    if name:
+        return (name if name in names else "", parent, role, "", session, saved)
+
+    for app in find_app_data_dirs():
+        db = app / "conversation_summaries.db"
+        if not db.is_file():
             continue
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-            row = conn.execute(
-                "SELECT agent_name, parent_conversation_id, title, raw_summary "
-                "FROM conversation_summaries WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            conn.close()
-            if row is not None:
-                agent_name = str(row[0] or "")
-                parent_id = str(row[1] or payload_parent)
-                title = str(row[2] or "")
-                raw = row[3]
-                if agent_name == "codex":
-                    role = title
-                    if isinstance(raw, (bytes, bytearray)):
-                        strings = [s.decode("utf-8", "ignore") for s in re.findall(rb"[ -~]{3,80}", raw)]
-                        if "codex" in strings:
-                            idx = len(strings) - 1 - strings[::-1].index("codex")
-                            if idx + 1 < len(strings):
-                                cand = strings[idx + 1].rstrip("0123456789 ")
-                                if cand and not cand.startswith("file://"):
-                                    role = cand
-                    return (True, parent_id, role or "Codex Subagent", "")
-                if agent_name in ("research", "self", "image-generator") or (not parent_id and not agent_name):
-                    return (False, parent_id, title, "")
-        except Exception:
-            pass
+            with closing(sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=0.1)) as conn:
+                row = conn.execute(
+                    "SELECT agent_name, parent_conversation_id, title FROM conversation_summaries "
+                    "WHERE conversation_id = ?", (conversation,),
+                ).fetchone()
+        except sqlite3.Error:
+            continue
+        if row and row[0]:
+            return (row[0] if row[0] in names else "", parent or row[1], role or row[2], "", session, saved)
 
-    # 3. Check undelivered messages in FileStore for invoke_subagent(TypeName="codex")
-    for app_dir in app_dirs:
-        msg_dir = app_dir / "brain" / conversation_id / ".system_generated" / "messages"
-        if msg_dir.is_dir():
-            for jf in sorted(msg_dir.glob("*.json")):
-                try:
-                    mo = json.loads(jf.read_text(encoding="utf-8", errors="replace"))
-                    tc = ((mo.get("sourceMetadata") or {}).get("tool") or {}).get("toolCall") or {}
-                    if tc.get("name") == "invoke_subagent" and tc.get("argumentsJson"):
-                        t_args = json.loads(tc["argumentsJson"])
-                        if t_args.get("TypeName") == "codex":
-                            return (
-                                True,
-                                str(mo.get("sender") or payload_parent),
-                                str(t_args.get("Role") or "Codex Subagent"),
-                                str(t_args.get("Prompt") or ""),
-                            )
-                except Exception:
-                    pass
-
-    return (False, payload_parent, "", "")
+    for directory in message_dirs(conversation, payload.get("transcriptPath") or ""):
+        for path in sorted(directory.glob("*.json")):
+            try:
+                msg = read_object(path)
+                args = invoke_arguments(msg)
+                if args.get("TypeName") in names:
+                    return (args["TypeName"], parent or sender_id(msg), role or args.get("Role") or "",
+                            args.get("Prompt") or "", session, saved)
+            except (OSError, ValueError, AttributeError, TypeError):
+                continue
+    return "", parent, "", "", session, saved
 
 
-def post_bridge_json(base_url: str, path: str, payload: Dict[str, Any], timeout: float = 15.0) -> Dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
+def post_bridge_json(base_url: str, path: str, payload: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     req = urllib.request.Request(
-        f"{base_url}{path}",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        f"{base_url}{path}", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw) if raw.strip() else {}
+        return json.loads(resp.read() or b"{}")
+
+
+def language_server_post(address: str, token: str, method: str, payload: dict, timeout: float = 2.0) -> None:
+    base = address if address.startswith(("http://", "https://")) else f"http://{address}"
+    request = urllib.request.Request(
+        f"{base.rstrip('/')}/exa.language_server_pb.LanguageServerService/{method}",
+        data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "x-codeium-csrf-token": token},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
 
 
 def main() -> None:
     try:
-        raw_stdin = sys.stdin.read()
-        payload = json.loads(raw_stdin) if raw_stdin.strip() else {}
-    except Exception:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict) or payload.get("hookEventName", "PreInvocation") != "PreInvocation":
+            print("{}")
+            return
+    except (ValueError, TypeError):
         print("{}")
         return
 
-    event_name = str(payload.get("hookEventName") or "PreInvocation")
-    if event_name != "PreInvocation":
+    conversation = payload.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+    if not isinstance(conversation, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation):
         print("{}")
         return
-
-    conv_id = str(payload.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or "")
-    ls_address, csrf_token, agentapi_exe = hydrate_ls_env_from_state()
-
-    is_codex, parent_id, role, initial_prompt = check_is_codex_subagent(payload, conv_id, agentapi_exe)
-
-    if not is_codex:
-        if ls_address and csrf_token:
+    name, parent, role, initial, session, saved = get_route(payload, conversation)
+    address = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
+    csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
+    exe = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE") or shutil.which("agy") or "agy"
+    if not name:
+        if address:
             try:
-                post_bridge_json(
-                    f"http://{BRIDGE_HOST}:{BRIDGE_PORT}",
-                    "/api/ls-credentials",
-                    {
-                        "lsAddress": ls_address,
-                        "csrfToken": csrf_token,
-                        "agentapiExe": agentapi_exe,
-                    },
-                    timeout=0.3,
-                )
-            except Exception:
+                post_bridge_json(f"http://{BRIDGE_HOST}:{BRIDGE_PORT}", "/api/ls-credentials",
+                                 {"lsAddress": address, "csrfToken": csrf, "agentapiExe": exe}, timeout=0.3)
+            except OSError:
                 pass
+        print("{}")
+        return
+
+    cwd = payload.get("cwd") or next(iter(payload.get("workspacePaths") or []), os.getcwd())
+    profile = saved.get("profiles", {}).get(name) or load_profiles().get(name) or load_config()
+    if live_sdk_instance(session) or (
+        profile["executionMode"] == "sdkExecutor" and active_sdk_definition(name, cwd)
+    ):
+        # Pass through before reading FileStore markers or calling CancelCascadeInvocation.
         print("{}")
         return
 
     try:
-        base_url = ensure_bridge_daemon_running(BRIDGE_PORT)
-        workspace_paths = payload.get("workspacePaths") or []
-        cwd = payload.get("cwd") or (workspace_paths[0] if workspace_paths else os.getcwd())
-        raw_transcript_path = payload.get("transcriptPath") or ""
-        compact_transcript_path = normalize_compact_transcript_path(raw_transcript_path, conv_id)
-
-        # 1. Primary input source: drain undelivered messages from `.system_generated/messages/undelivered/`
-        fs_content, fs_sender, fs_role = drain_undelivered_filestore_messages(conv_id, raw_transcript_path)
-        if fs_sender and not parent_id:
-            parent_id = fs_sender
-        if fs_role and (not role or role == "Codex Subagent"):
-            role = fs_role
-
-        last_user_input = fs_content or (payload.get("lastUserInput") or "").strip()
-        if not last_user_input:
-            tr_input, tr_sender = extract_latest_input_from_transcripts(raw_transcript_path, conv_id)
-            if tr_input:
-                last_user_input = tr_input
-            if tr_sender and not parent_id:
-                parent_id = tr_sender
-        if not last_user_input and initial_prompt:
-            last_user_input = initial_prompt
-
-        dispatch_res = post_bridge_json(
-            base_url,
-            "/api/dispatch",
-            {
-                "conversationId": conv_id,
-                "parentConversationId": parent_id,
-                "role": role or "Codex Subagent",
-                "cwd": cwd,
-                "transcriptPath": compact_transcript_path,
-                "userInput": last_user_input,
-                "lsAddress": ls_address,
-                "csrfToken": csrf_token,
-                "agentapiExe": agentapi_exe,
-            },
-            timeout=20.0,
-        )
-
-        action = dispatch_res.get("action", "turn/start")
-        thread_id = dispatch_res.get("threadId", "unknown")
-        turn_id = dispatch_res.get("turnId", "unknown")
-
-        # Cancel the Gemini ordinaryExecutor invocation context for this child conversation
-        # (with notifyParent=False) so ordinaryExecutor exits immediately without calling Gemini LLM!
-        if ls_address:
+        if not address:
+            source = session if session.get("lsAddress") else saved
+            address, csrf = source.get("lsAddress", ""), source.get("csrfToken", "")
+        base = ensure_bridge_daemon_running(BRIDGE_PORT)
+        transcript = payload.get("transcriptPath") or ""
+        text, sender, message_role, markers = pending_messages(conversation, transcript)
+        parent = parent or sender
+        if message_role and (not role or role == "Codex Subagent"):
+            role = message_role
+        source_id = input_id(markers) if markers else ""
+        if not text:
+            text = (payload.get("lastUserInput") or "").strip()
+        if not text:
+            text, sender, source_id = transcript_prompt(transcript, conversation)
+            parent = parent or sender
+        if not text and initial:
+            text, source_id = initial, input_id([conversation, "initial", initial])
+        result = post_bridge_json(base, "/api/dispatch", {
+            "conversationId": conversation, "parentConversationId": parent, "agentName": name,
+            "executionMode": "preInvocation", "role": role or "Codex Subagent", "cwd": cwd,
+            "transcriptPath": normalize_transcript_path(transcript, conversation), "userInput": text,
+            "lsAddress": address, "csrfToken": csrf, "agentapiExe": exe, "inputId": source_id,
+        }, timeout=20)
+        if result.get("action") == "sdkExecutor":
+            print("{}")
+            return
+        acknowledge_messages(markers)
+        if address:
             try:
-                cancel_req = urllib.request.Request(
-                    f"http://{ls_address}/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation",
-                    data=json.dumps(
-                        {
-                            "cascadeId": conv_id,
-                            "killBackgroundTasks": False,
-                            "notifyParent": False,
-                        }
-                    ).encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        **({"x-codeium-csrf-token": csrf_token} if csrf_token else {}),
-                    },
-                    method="POST",
-                )
-                urllib.request.urlopen(cancel_req, timeout=2.0).read()
-            except Exception:
+                language_server_post(address, csrf, "CancelCascadeInvocation",
+                                     {"cascadeId": conversation, "killBackgroundTasks": False, "notifyParent": False})
+            except OSError:
                 pass
-
-        hook_output = {
-            "injectSteps": [
-                {
-                    "systemMessage": {
-                        "systemMessage": "",
-                        "metadata": {
-                            "user_markdown": (
-                                f"⚡ **Codex App-Server Daemon** accepted `{action}`\n"
-                                f"- **Role**: `{role or 'Codex Subagent'}`\n"
-                                f"- **Codex Thread**: `{thread_id}`\n"
-                                f"- **Active Turn**: `{turn_id}`"
-                            )
-                        },
-                    }
-                }
-            ],
+        print(json.dumps({
             "terminationBehavior": "terminate",
-        }
-        print(json.dumps(hook_output))
-    except Exception as e:
-        err_output = {
-            "injectSteps": [
-                {
-                    "errorMessage": {
-                        "userMessage": f"Codex Subagent Bridge error: {e}",
-                    }
-                }
-            ],
+            "injectSteps": [{
+                "systemMessage": {"systemMessage": "", "metadata": {
+                    "user_markdown": f"Codex accepted `{result.get('action')}` for {role or 'Codex Subagent'}."
+                }},
+            }],
+        }))
+    except Exception as exc:
+        try:
+            acknowledge_messages(locals().get("markers") or [])
+        except Exception:
+            pass
+        if address:
+            try:
+                language_server_post(
+                    address,
+                    csrf,
+                    "CancelCascadeInvocation",
+                    {"cascadeId": conversation, "killBackgroundTasks": False, "notifyParent": False},
+                )
+            except OSError:
+                pass
+        print(json.dumps({
             "terminationBehavior": "terminate",
-        }
-        print(json.dumps(err_output))
+            "injectSteps": [{"errorMessage": {"userMessage": f"Codex Subagent Bridge error: {exc}"}}],
+        }))
 
 
 if __name__ == "__main__":

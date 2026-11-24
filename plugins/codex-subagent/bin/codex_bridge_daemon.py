@@ -25,11 +25,14 @@ Responsibilities:
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
 import json
 import logging
 import os
 import re
+import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -39,13 +42,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from codex_profiles import (
+    PROFILE_DIR, apply_files, definition_changes, live_sdk_instance, load_config, load_profiles, normalize_profile,
+    validate_name, validate_settings, write_object,
+)
 from codex_ws_client import CodexAppServerClient, CodexRpcError
 
 logging.basicConfig(
@@ -76,15 +84,17 @@ def utc_now_iso() -> str:
 
 
 def find_app_data_dirs() -> List[Path]:
+    override = os.environ.get("AGY_CODEX_APP_DATA_DIR")
+    if override:
+        return [Path(override).resolve()]
     dirs: List[Path] = []
     env_data = os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR", "")
     if env_data:
         p = Path(env_data).resolve()
-        for parent in [p] + list(p.parents):
-            if parent.name == "sidecar_data":
-                candidate = parent.parent
-                if (candidate / "brain").exists():
-                    dirs.append(candidate)
+        for parent in (p, *p.parents):
+            if (parent / "brain").is_dir():
+                dirs.append(parent)
+                break
     gemini_root = Path.home() / ".gemini"
     for name in ("antigravity-cli", "antigravity", "antigravity-ide"):
         candidate = gemini_root / name
@@ -224,6 +234,7 @@ def summarize_transcript_file(transcript_path: Path, max_steps: int = 40) -> Dic
                 "thinking": thinking[:600] if thinking else "",
                 "response": response_text[:800] if response_text else "",
                 "content": content_text[:800] if content_text else "",
+                "error": str(step.get("error") or "")[:600],
                 "tools": tool_labels,
             }
         )
@@ -289,11 +300,15 @@ class UnifiedSubagentBridge:
         self.app_data = primary_app_data_dir()
         self.state_file = state_file or (self.app_data / "codex_subagent_state.json")
         self.lock = threading.RLock()
+        self.turn_changed = threading.Condition(self.lock)
+        self._conversation_locks: Dict[str, threading.RLock] = {}
+        self._thread_connections: Dict[str, Any] = {}
+        self._approval_replies: Dict[str, Callable[..., None]] = {}
 
         # Language Server credentials (updated dynamically from env / hooks / sidecar)
         self.ls_address: str = os.environ.get("ANTIGRAVITY_LS_ADDRESS", "")
         self.csrf_token: str = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "")
-        self.agentapi_exe: str = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE", "/home/zhdi/.local/bin/agy")
+        self.agentapi_exe: str = os.environ.get("ANTIGRAVITY_AGENTAPI_EXE", (shutil.which("agy") or "agy"))
 
         # Session maps:
         # sessions_by_conv: conversationId -> session dict
@@ -302,10 +317,11 @@ class UnifiedSubagentBridge:
         self.conv_by_thread: Dict[str, str] = {}
 
         # Per-item live buffers for active Codex turns: itemId -> dict
-        self._item_buffers: Dict[str, Dict[str, Any]] = {}
+        self._item_buffers: Dict[tuple, Dict[str, Any]] = {}
         # Pending approval requests: approvalId -> {req_id, method, params, conversationId, threadId, createdAt}
         self.pending_approvals: Dict[str, Dict[str, Any]] = {}
 
+        self.profiles: Dict[str, Dict[str, Any]] = {}
         self._load_state()
 
         self.codex = CodexAppServerClient()
@@ -317,37 +333,148 @@ class UnifiedSubagentBridge:
     # -------------------------------------------------------------------------
 
     def _load_state(self) -> None:
-        if not self.state_file.exists():
-            return
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            with self.lock:
-                self.ls_address = data.get("lsAddress") or self.ls_address
-                self.csrf_token = data.get("csrfToken") or self.csrf_token
+        if self.state_file.exists():
+            try:
+                data = json.loads(self.state_file.read_text(encoding="utf-8"))
+                self.ls_address = self.ls_address or data.get("lsAddress", "")
+                self.csrf_token = self.csrf_token or data.get("csrfToken", "")
+                self.profiles = {name: normalize_profile(profile) for name, profile in data.get("profiles", {}).items()}
                 for conv_id, sess in (data.get("sessions") or {}).items():
-                    if isinstance(sess, dict):
-                        self.sessions_by_conv[conv_id] = sess
-                        tid = sess.get("threadId")
-                        if tid:
-                            self.conv_by_thread[tid] = conv_id
-        except Exception as e:
-            logger.warning("Failed to load bridge state file %s: %s", self.state_file, e)
+                    if not isinstance(sess, dict):
+                        continue
+                    if sess.get("activeTurnId") or sess.get("status") in ("starting", "initializing", "interrupting"):
+                        sess.update(status="error", activeTurnId=None, currentActivity="Bridge restarted during turn")
+                    if sess.get("idleSignal") == "pending":
+                        sess["idleSignal"] = "failed"
+                    # Re-established by a live executor, including when it reconnects after a restart.
+                    sess.pop("sdkInstanceId", None)
+                    self.sessions_by_conv[conv_id] = sess
+                    if sess.get("threadId"):
+                        self.conv_by_thread[sess["threadId"]] = conv_id
+            except (OSError, ValueError, TypeError, AttributeError) as e:
+                logger.warning("Failed to load bridge state file %s: %s", self.state_file, e)
+        self.profiles.update(load_profiles())
 
-    def _save_state(self) -> None:
+    def _save_state(self, *, required: bool = False) -> None:
         try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
             with self.lock:
-                payload = {
+                write_object(self.state_file, {
                     "lsAddress": self.ls_address,
                     "csrfToken": self.csrf_token,
                     "updatedAt": utc_now_iso(),
                     "sessions": self.sessions_by_conv,
-                }
-            tmp = self.state_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            tmp.replace(self.state_file)
-        except Exception as e:
+                    "profiles": self.profiles,
+                })
+        except OSError as e:
+            if required:
+                raise
             logger.warning("Failed to save bridge state: %s", e)
+
+    def list_profiles(self) -> Dict[str, Any]:
+        with self.lock:
+            return {"profiles": [dict(self.profiles[name]) for name in sorted(self.profiles)], "defaults": load_config()}
+
+    def define_profile(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        name = validate_name(body.get("name"))
+        with self.lock:
+            previous = self.profiles.get(name)
+            profile = normalize_profile(body, previous)
+            changes = definition_changes(name, profile)
+            definitions = [str(path) for path, value in changes.items() if value]
+            changes[PROFILE_DIR / f"{name}.json"] = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
+            updated = {**self.profiles, name: profile}
+            self._persist_profiles(updated, changes)
+        return {"profile": profile, "definitions": definitions}
+
+    def delete_profile(self, name: str) -> Dict[str, Any]:
+        validate_name(name)
+        with self.lock:
+            if name not in self.profiles:
+                return {"deleted": False, "name": name}
+            updated = {key: profile for key, profile in self.profiles.items() if key != name}
+            changes = definition_changes(name, None)
+            changes[PROFILE_DIR / f"{name}.json"] = None
+            self._persist_profiles(updated, changes)
+        return {"deleted": True, "name": name}
+
+    def _persist_profiles(self, updated: Dict[str, Any], changes: Dict[Path, Optional[str]]) -> None:
+        # Commit the native definitions and both persistent profile representations together.
+        # The caller holds self.lock through publication.
+        changes[self.state_file] = json.dumps({
+            "lsAddress": self.ls_address, "csrfToken": self.csrf_token,
+            "updatedAt": utc_now_iso(), "sessions": self.sessions_by_conv, "profiles": updated,
+        }, ensure_ascii=False, indent=2) + "\n"
+        apply_files(changes)
+        self.profiles = updated
+
+    @staticmethod
+    def _validate_conversation_id(conversation_id: str) -> None:
+        if not isinstance(conversation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation_id):
+            raise ValueError("Invalid conversationId")
+
+    def _conversation_lock(self, conversation_id: str) -> threading.RLock:
+        self._validate_conversation_id(conversation_id)
+        with self.lock:
+            return self._conversation_locks.setdefault(conversation_id, threading.RLock())
+
+    def _new_session(self, conversation_id: str, agent_name: str) -> Dict[str, Any]:
+        settings = load_config()
+        if agent_name != "codex":
+            if agent_name not in self.profiles:
+                raise ValueError(f"Unknown Codex profile {agent_name!r}")
+            settings.update(self.profiles[agent_name])
+        return {
+            "conversationId": conversation_id, "parentConversationId": "", "agentName": agent_name,
+            "engine": "codex", "role": "Codex Subagent", "cwd": "", "transcriptPath": "",
+            "threadId": None, "activeTurnId": None, "status": "idle", "executionMode": "preInvocation",
+            "model": settings["model"], "effort": settings["effort"],
+            "sandbox": settings["sandboxMode"], "approvalPolicy": settings["approvalPolicy"],
+            "approvalMode": "interactive", "systemPrompt": settings.get("systemPrompt", ""),
+            "stepCount": 0, "nextStepIndex": 0, "turnHistory": [], "events": [],
+            "createdAt": utc_now_iso(), "updatedAt": utc_now_iso(),
+        }
+
+    def register_sdk(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        conversation_id, instance = body["conversationId"], body["sdkInstanceId"]
+        if not isinstance(instance, str) or not instance:
+            raise ValueError("sdkInstanceId is required")
+        pid = body.get("sdkPid")
+        if pid is not None and (type(pid) is not int or pid <= 0):
+            raise ValueError("Invalid sdkPid")
+        with self._conversation_lock(conversation_id), self.lock:
+            session = self.sessions_by_conv.get(conversation_id)
+            agent_name = body.get("agentName") or "codex"
+            if session is None:
+                session = self._new_session(conversation_id, agent_name)
+                self.sessions_by_conv[conversation_id] = session
+            elif session.get("agentName", "codex") != agent_name:
+                raise ValueError("SDK executor agent name differs from the conversation profile")
+            if body.get("parentConversationId"):
+                session["parentConversationId"] = body["parentConversationId"]
+            if body.get("lsAddress"):
+                session.update(lsAddress=body["lsAddress"], csrfToken=body.get("csrfToken") or "")
+            session.update(agentName=agent_name, executionMode="sdkExecutor", sdkInstanceId=instance, sdkPid=pid)
+            self._save_state()
+        return self.sdk_status(conversation_id, instance)
+
+    def sdk_status(self, conversation_id: str, instance: str) -> Dict[str, Any]:
+        self._validate_conversation_id(conversation_id)
+        with self.lock:
+            session = self.sessions_by_conv.get(conversation_id)
+            if not session or session.get("sdkInstanceId") != instance:
+                return {"registered": False, "replaced": bool(session and session.get("sdkInstanceId"))}
+            return {
+                "registered": True, "status": session["status"], "activeTurnId": session.get("activeTurnId"),
+                "lastTerminalTurnId": session.get("lastTerminalTurnId"),
+                "idleSignal": session.get("idleSignal"), "idleSignalTurnId": session.get("idleSignalTurnId"),
+            }
+
+    def unregister_sdk(self, conversation_id: str, instance: str) -> None:
+        with self._conversation_lock(conversation_id), self.lock:
+            session = self.sessions_by_conv.get(conversation_id)
+            if session and session.get("sdkInstanceId") == instance:
+                session.pop("sdkInstanceId")
+                self._save_state()
 
     def update_ls_credentials(
         self,
@@ -356,17 +483,13 @@ class UnifiedSubagentBridge:
         agentapi_exe: Optional[str] = None,
     ) -> None:
         with self.lock:
-            changed = False
-            if ls_address and ls_address != self.ls_address:
+            before = (self.ls_address, self.csrf_token, self.agentapi_exe)
+            if ls_address:
                 self.ls_address = ls_address
-                changed = True
-            if csrf_token and csrf_token != self.csrf_token:
-                self.csrf_token = csrf_token
-                changed = True
-            if agentapi_exe and agentapi_exe != self.agentapi_exe:
+                self.csrf_token = csrf_token or ""
+            if agentapi_exe:
                 self.agentapi_exe = agentapi_exe
-                changed = True
-            if changed:
+            if before != (self.ls_address, self.csrf_token, self.agentapi_exe):
                 self._save_state()
 
     # -------------------------------------------------------------------------
@@ -381,23 +504,21 @@ class UnifiedSubagentBridge:
         csrf_token: Optional[str] = None,
         timeout: float = 10.0,
     ) -> Dict[str, Any]:
-        addr = ls_address or self.ls_address
-        token = csrf_token or self.csrf_token
+        with self.lock:
+            addr = ls_address or self.ls_address
+            token = csrf_token if csrf_token is not None else self.csrf_token
         if not addr:
             raise RuntimeError("Language Server address (ANTIGRAVITY_LS_ADDRESS) is not known yet")
-        url = f"http://{addr}/exa.language_server_pb.LanguageServerService/{method}"
+        base = addr if addr.startswith(("http://", "https://")) else f"http://{addr}"
+        url = f"{base.rstrip('/')}/exa.language_server_pb.LanguageServerService/{method}"
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if token:
             headers["x-codeium-csrf-token"] = token
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                return json.loads(raw) if raw.strip() else {}
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LS RPC {method} HTTP {e.code}: {err_body}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw.strip() else {}
 
     def send_message_to_agy_conversation(
         self,
@@ -432,7 +553,7 @@ class UnifiedSubagentBridge:
         except Exception as e:
             logger.warning("SendAgentMessage RPC failed (%s); falling back to agentapi CLI...", e)
 
-        exe = self.agentapi_exe or "/home/zhdi/.local/bin/agy"
+        exe = self.agentapi_exe or (shutil.which("agy") or "agy")
         cmd = [exe, "agentapi", "send-message"]
         if title:
             cmd.extend(["--title", title])
@@ -461,15 +582,14 @@ class UnifiedSubagentBridge:
             if not db_path.exists():
                 continue
             try:
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-                conn.row_factory = sqlite3.Row
-                row = conn.execute(
-                    "SELECT conversation_id, title, preview, step_count, workspace_uris, status, "
-                    "agent_name, parent_conversation_id, nesting_depth, not_fully_idle, killed, raw_summary "
-                    "FROM conversation_summaries WHERE conversation_id = ?",
-                    (conversation_id,),
-                ).fetchone()
-                conn.close()
+                with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT conversation_id, title, preview, step_count, workspace_uris, status, "
+                        "agent_name, parent_conversation_id, nesting_depth, not_fully_idle, killed, raw_summary "
+                        "FROM conversation_summaries WHERE conversation_id = ?",
+                        (conversation_id,),
+                    ).fetchone()
                 if row:
                     d = dict(row)
                     raw = d.pop("raw_summary", None)
@@ -539,27 +659,28 @@ class UnifiedSubagentBridge:
         not_fully_idle: int = 0,
     ) -> None:
         """Updates conversation_summaries.db so native agy UI reflects live step counts & run state."""
-        db_path = self.app_data / "conversation_summaries.db"
+        session = self.sessions_by_conv.get(conversation_id) or {}
+        db_dir = Path(session.get("appDataDir") or self.app_data)
+        db_path = db_dir / "conversation_summaries.db"
         if not db_path.exists():
             return
         try:
-            conn = sqlite3.connect(str(db_path), timeout=2.0)
-            if preview:
-                conn.execute(
-                    "UPDATE conversation_summaries SET status = ?, step_count = MAX(step_count, ?), "
-                    "preview = ?, not_fully_idle = ?, last_modified_time = datetime('now') "
-                    "WHERE conversation_id = ?",
-                    (status, step_count, preview[:240], not_fully_idle, conversation_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE conversation_summaries SET status = ?, step_count = MAX(step_count, ?), "
-                    "not_fully_idle = ?, last_modified_time = datetime('now') "
-                    "WHERE conversation_id = ?",
-                    (status, step_count, not_fully_idle, conversation_id),
-                )
-            conn.commit()
-            conn.close()
+            with closing(sqlite3.connect(str(db_path), timeout=0.25)) as conn:
+                if preview:
+                    conn.execute(
+                        "UPDATE conversation_summaries SET status = ?, step_count = MAX(step_count, ?), "
+                        "preview = ?, not_fully_idle = ?, last_modified_time = datetime('now') "
+                        "WHERE conversation_id = ?",
+                        (status, step_count, preview[:240], not_fully_idle, conversation_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE conversation_summaries SET status = ?, step_count = MAX(step_count, ?), "
+                        "not_fully_idle = ?, last_modified_time = datetime('now') "
+                        "WHERE conversation_id = ?",
+                        (status, step_count, not_fully_idle, conversation_id),
+                    )
+                conn.commit()
         except Exception as e:
             logger.debug("SQLite status sync skipped: %s", e)
 
@@ -577,247 +698,210 @@ class UnifiedSubagentBridge:
         role: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
-        sandbox: str = "workspace-write",
-        approval_policy: str = "never",
+        sandbox: Optional[str] = None,
+        approval_policy: Optional[str] = None,
         ls_address: Optional[str] = None,
         csrf_token: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+        sdk_instance: Optional[str] = None,
+        input_id: Optional[str] = None,
+        additional_context: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Entry point called when `PreInvocation` hook intercepts a `codex` subagent turn
-        or when the user/parent explicitly dispatches or steers a Codex subagent.
-        """
-        self.update_ls_credentials(ls_address=ls_address, csrf_token=csrf_token)
-
-        # Unwrap "Message from <parent-id>: ..." or "<SYSTEM_MESSAGE>[Message] sender=<parent-id> content=..."
-        clean_text = (user_input or "").strip()
+        clean_text = user_input.strip()
         extracted_parent = parent_conversation_id or ""
-        m_sys = SYSTEM_MSG_TAG_RE.search(clean_text)
-        if m_sys:
-            if not extracted_parent:
-                extracted_parent = m_sys.group(1).strip()
-            clean_text = m_sys.group(2).strip()
-        else:
-            m = MESSAGE_FROM_RE.match(clean_text)
-            if m:
-                if not extracted_parent:
-                    extracted_parent = m.group(1).strip()
-                clean_text = m.group(2).strip()
+        wrapped = SYSTEM_MSG_TAG_RE.search(clean_text) or MESSAGE_FROM_RE.match(clean_text)
+        if wrapped:
+            extracted_parent = extracted_parent or wrapped.group(1).strip()
+            clean_text = wrapped.group(2).strip()
 
-        # Check SQLite metadata if parent or role is still missing
-        db_meta = self.query_db_conversation_meta(conversation_id)
-        if db_meta:
-            if not extracted_parent:
-                extracted_parent = db_meta.get("parent_conversation_id") or ""
-            if not role:
-                role = db_meta.get("role") or db_meta.get("title") or "Codex Subagent"
-            if not cwd:
-                try:
-                    uris = json.loads(db_meta.get("workspace_uris") or "[]")
-                    if uris and isinstance(uris[0], str) and uris[0].startswith("file://"):
-                        cwd = urllib.parse.unquote(uris[0][len("file://") :])
-                except Exception:
-                    pass
+        with self._conversation_lock(conversation_id):
+            with self.lock:
+                session = self.sessions_by_conv.get(conversation_id)
+            if not session or not session.get("threadId"):
+                db_meta = self.query_db_conversation_meta(conversation_id) or {}
+                extracted_parent = extracted_parent or db_meta.get("parent_conversation_id", "")
+                role = role or db_meta.get("role") or db_meta.get("title")
+                db_agent_name = db_meta.get("agent_name")
+                with self.lock:
+                    if not agent_name and db_agent_name in self.profiles:
+                        agent_name = db_agent_name
+                if not cwd:
+                    try:
+                        uris = json.loads(db_meta.get("workspace_uris") or "[]")
+                        if uris and uris[0].startswith("file://"):
+                            cwd = urllib.parse.unquote(uris[0][len("file://"):])
+                    except (ValueError, TypeError, AttributeError):
+                        pass
 
-        with self.lock:
-            session = self.sessions_by_conv.get(conversation_id)
-            if session is None:
-                session = {
-                    "conversationId": conversation_id,
-                    "parentConversationId": extracted_parent,
-                    "engine": "codex",
-                    "role": role or "Codex Engineer",
-                    "cwd": cwd or os.getcwd(),
-                    "transcriptPath": transcript_path
-                    or str(
-                        self.app_data
-                        / "brain"
-                        / conversation_id
-                        / ".system_generated"
-                        / "logs"
-                        / "transcript.jsonl"
-                    ),
-                    "threadId": None,
-                    "activeTurnId": None,
-                    "status": "initializing",
-                    "model": model or "",
-                    "effort": effort or "high",
-                    "sandbox": sandbox,
-                    "approvalPolicy": approval_policy,
-                    "approvalMode": "auto_accept",
-                    "stepCount": 0,
-                    "nextStepIndex": 0,
-                    "currentActivity": "Initializing Codex thread...",
-                    "activityKind": "thinking",
-                    "latestDiff": "",
-                    "plan": [],
-                    "planExplanation": "",
-                    "lastAgentMessage": "",
-                    "lastThinking": "",
-                    "turnHistory": [],
-                    "events": [],
-                    "createdAt": utc_now_iso(),
-                    "updatedAt": utc_now_iso(),
-                }
-                self.sessions_by_conv[conversation_id] = session
-            else:
+            with self.lock:
+                if execution_mode == "sdkExecutor" and (
+                    not sdk_instance or not session or session.get("sdkInstanceId") != sdk_instance
+                ):
+                    raise ValueError("SDK executor must register before dispatch")
+                if session and execution_mode == "preInvocation" and live_sdk_instance(session):
+                    return {"action": "sdkExecutor", "conversationId": conversation_id}
+                if session is None:
+                    session = self._new_session(conversation_id, agent_name or "codex")
+                    self.sessions_by_conv[conversation_id] = session
+                if agent_name and session.get("agentName", "codex") != agent_name:
+                    raise ValueError("The conversation is already bound to a different profile")
+                if execution_mode == "preInvocation":
+                    session.pop("sdkInstanceId", None)
+                    session.pop("sdkPid", None)
+                    session["executionMode"] = "preInvocation"
+                if session["status"] == "killed":
+                    raise ValueError(f"Conversation {conversation_id} has been killed")
+                if input_id and input_id in session.get("dispatchedInputs", {}):
+                    return session["dispatchedInputs"][input_id]
+                if not clean_text:
+                    return {"action": "no_input", "conversationId": conversation_id}
+                settings = validate_settings({
+                    "executionMode": session.get("executionMode", "preInvocation"),
+                    "model": model or session.get("model") or load_config()["model"],
+                    "effort": effort or session.get("effort") or load_config()["effort"],
+                    "approvalPolicy": approval_policy or session.get("approvalPolicy", "never"),
+                    "sandboxMode": sandbox or session.get("sandbox", "workspace-write"),
+                })
+                session.update(model=settings["model"], effort=settings["effort"])
+                if not session.get("threadId"):
+                    session.update(sandbox=settings["sandboxMode"], approvalPolicy=settings["approvalPolicy"])
                 if extracted_parent and not session.get("parentConversationId"):
                     session["parentConversationId"] = extracted_parent
-                if cwd:
-                    session["cwd"] = cwd
-                if transcript_path:
-                    session["transcriptPath"] = transcript_path
-                if role and (not session.get("role") or session["role"] == "Codex Subagent"):
+                if cwd or not session.get("cwd"):
+                    session["cwd"] = cwd or os.getcwd()
+                if transcript_path and transcript_path != session.get("transcriptPath"):
+                    session.update(transcriptPath=transcript_path, nextStepIndex=0)
+                if not session.get("appDataDir"):
+                    for app_data in find_app_data_dirs():
+                        if (app_data / "brain" / conversation_id).is_dir():
+                            session["appDataDir"] = str(app_data)
+                            break
+                if role and session.get("role") in ("", None, "Codex Subagent"):
                     session["role"] = role
-                if model:
-                    session["model"] = model
-                if effort:
-                    session["effort"] = effort
+                if ls_address:
+                    session.update(lsAddress=ls_address, csrfToken=csrf_token or "")
 
-        # Ensure Codex thread exists
-        thread_id = session.get("threadId")
-        if not thread_id:
-            dev_instructions = (
-                "You are running as a native OpenAI Codex Subagent inside Google Antigravity (agy).\n"
-                f"Your Assigned Role: {session.get('role', 'Codex Subagent')}\n"
-                f"Subagent Conversation ID: {conversation_id}\n"
-                f"Parent Conversation ID: {session.get('parentConversationId', 'unknown')}\n"
-                "You have direct access to dynamic tools `agy_notify_parent` (to send mid-turn progress "
-                "or questions to the parent agent) and `agy_list_sibling_subagents` (to inspect sibling subagents). "
-                "When your turn completes, your final response and unified diff summary will be delivered "
-                "automatically to the parent Antigravity agent."
-            )
-            start_res = self.codex.thread_start(
-                cwd=session.get("cwd"),
-                model=session.get("model") or None,
-                approval_policy=session.get("approvalPolicy", "never"),
-                sandbox=session.get("sandbox", "workspace-write"),
-                developer_instructions=dev_instructions,
-                dynamic_tools=DYNAMIC_TOOLS_SPEC,
-            )
-            thread_obj = start_res.get("thread") or {}
-            thread_id = thread_obj.get("id")
-            if not thread_id:
-                raise RuntimeError(f"Codex thread/start did not return thread.id: {start_res}")
-            with self.lock:
-                session["threadId"] = thread_id
-                if start_res.get("model"):
-                    session["model"] = start_res["model"]
-                if start_res.get("reasoningEffort"):
-                    session["effort"] = start_res["reasoningEffort"]
-                self.conv_by_thread[thread_id] = conversation_id
-                self._save_state()
-
-        # Check for control command prefixes: [STEER], [QUEUE], [INTERRUPT], [REVERT:N], [COMPACT], [MODEL:...], [EFFORT:...]
-        cmd_match = PREFIX_CMD_RE.match(clean_text)
-        if cmd_match:
-            directive = cmd_match.group(1).upper()
-            remainder = cmd_match.group(2).strip()
-            return self._execute_directive(session, directive, remainder)
-
-        # Log user/parent message into transcript.jsonl
-        self._append_transcript_step(
-            session,
-            {
-                "source": "USER_EXPLICIT",
-                "type": "USER_INPUT",
-                "status": "DONE",
-                "content": clean_text,
-            },
-        )
-
-        active_turn_id = session.get("activeTurnId")
-        is_working = session.get("status") == "working" and bool(active_turn_id)
-
-        # If a turn is currently running, AUTOMATICALLY MID-TURN STEER IT!
-        if is_working and active_turn_id:
             try:
-                steer_res = self.codex.turn_steer(
-                    thread_id=thread_id,
-                    expected_turn_id=active_turn_id,
-                    steer_text=clean_text,
-                )
-                self._record_event(session, "turn/steer", {"turnId": active_turn_id, "text": clean_text[:300]})
-                self._append_transcript_step(
-                    session,
-                    {
-                        "source": "MODEL",
-                        "type": "PLANNER_RESPONSE",
-                        "status": "DONE",
-                        "model": session.get("model") or "codex",
-                        "thinking": f"**Mid-Turn Steer Applied to Turn {active_turn_id}**\n{clean_text}",
-                        "tool_calls": [],
-                    },
-                )
-                self._save_state()
-                return {
-                    "action": "turn/steer",
-                    "conversationId": conversation_id,
-                    "threadId": thread_id,
-                    "turnId": steer_res.get("turnId", active_turn_id),
-                    "status": "steered",
-                }
-            except CodexRpcError as e:
-                logger.info("turn/steer pre-condition missed (%s); falling back to turn/start", e)
+                self._ensure_thread(session)
+                directive = PREFIX_CMD_RE.match(clean_text)
+                if directive:
+                    result = self._execute_directive(session, directive[1].upper(), directive[2].strip())
+                else:
+                    result = self._dispatch_turn(session, clean_text, additional_context)
+            except Exception as e:
+                with self.lock:
+                    if session["status"] == "starting" or not session.get("threadId"):
+                        session.update(status="error", currentActivity=f"Dispatch failed: {e}", activityKind="")
+                        self._sync_sqlite_status(conversation_id, "CASCADE_RUN_STATUS_IDLE", session.get("stepCount", 0))
+                        self._save_state()
+                raise
+            if input_id:
+                with self.lock:
+                    inputs = session.setdefault("dispatchedInputs", {})
+                    inputs[input_id] = result
+                    if len(inputs) > 80:
+                        inputs.pop(next(iter(inputs)))
+                    self._save_state()
+            return result
 
-        # Start a new turn on the thread
-        turn_res = self.codex.turn_start(
-            thread_id=thread_id,
-            prompt_text=clean_text,
-            cwd=session.get("cwd"),
-            model=session.get("model") or None,
-            effort=session.get("effort") or None,
+    def _ensure_thread(self, session: Dict[str, Any]) -> None:
+        self.codex.connect()
+        connection = self.codex.connection
+        tid = session.get("threadId")
+        if tid:
+            with self.lock:
+                same_connection = tid in self._thread_connections and self._thread_connections[tid] is connection
+                if not same_connection and tid in self._thread_connections:
+                    self._clear_disconnected_turn(session)
+            if not same_connection:
+                self.codex.thread_resume(tid, cwd=session["cwd"])
+                with self.lock:
+                    self._thread_connections[tid] = self.codex.connection
+            return
+
+        instructions = (
+            "You are running as a native OpenAI Codex Subagent inside Google Antigravity (agy).\n"
+            f"Your Assigned Role: {session['role']}\n"
+            f"Subagent Conversation ID: {session['conversationId']}\n"
+            f"Parent Conversation ID: {session['parentConversationId']}\n"
+            "Use agy_notify_parent to send interim progress and agy_list_sibling_subagents to inspect siblings. "
+            "Your final response and unified diff summary will be delivered to the parent conversation."
         )
-        turn_obj = turn_res.get("turn") or {}
-        turn_id = turn_obj.get("id")
+        if session.get("systemPrompt"):
+            instructions += f"\n\n{session['systemPrompt']}"
+        result = self.codex.thread_start(
+            cwd=session["cwd"], model=session["model"], effort=session["effort"],
+            approval_policy=session["approvalPolicy"], sandbox=session["sandbox"],
+            developer_instructions=instructions, dynamic_tools=DYNAMIC_TOOLS_SPEC,
+        )
+        tid = (result.get("thread") or {}).get("id")
+        if not tid:
+            raise RuntimeError("Codex thread/start did not return a thread ID")
         with self.lock:
-            session["activeTurnId"] = turn_id
-            session["status"] = "working"
-            session["currentActivity"] = "Starting Codex turn..."
-            session["activityKind"] = "thinking"
-            session["lastAgentMessage"] = ""
-            session["lastThinking"] = ""
-            self._record_event(session, "turn/start", {"turnId": turn_id, "prompt": clean_text[:300]})
+            session["threadId"] = tid
+            self.conv_by_thread[tid] = session["conversationId"]
+            self._thread_connections[tid] = connection
             self._save_state()
 
-        self._sync_sqlite_status(
-            conversation_id,
-            status="CASCADE_RUN_STATUS_RUNNING",
-            step_count=session.get("stepCount", 1),
-            preview=clean_text[:160],
-            not_fully_idle=1,
-        )
-        return {
-            "action": "turn/start",
-            "conversationId": conversation_id,
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "status": "working",
-        }
+    def _dispatch_turn(self, session: Dict[str, Any], text: str, context: Optional[str] = None) -> Dict[str, Any]:
+        cid, tid = session["conversationId"], session["threadId"]
+        with self.lock:
+            active_turn = session.get("activeTurnId")
+            if session["status"] == "interrupting":
+                raise ValueError("Wait for the interrupted turn to complete before dispatching again")
+            self._append_transcript_step(session, {
+                "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "content": text,
+            })
+
+        if active_turn:
+            try:
+                result = self.codex.turn_steer(tid, active_turn, text, additional_context=context)
+            except CodexRpcError as e:
+                # Only retry a steer the server explicitly rejected because its turn ended.
+                if "no active turn" not in e.message.lower() and "expected active turn" not in e.message.lower():
+                    raise
+                with self.turn_changed:
+                    self.turn_changed.wait_for(lambda: session.get("activeTurnId") != active_turn, timeout=2)
+                    if session.get("activeTurnId"):
+                        raise
+            else:
+                self._record_event(session, "turn/steer", {"turnId": active_turn, "text": text[:300]})
+                self._save_state()
+                return {"action": "turn/steer", "conversationId": cid, "threadId": tid,
+                        "turnId": result.get("turnId", active_turn), "status": "steered"}
+
+        with self.lock:
+            session.update(status="starting", currentActivity="Starting Codex turn...", activityKind="thinking",
+                           lastAgentMessage="", lastThinking="", latestDiff="", plan=[], planExplanation="")
+            self._sync_sqlite_status(cid, "CASCADE_RUN_STATUS_RUNNING", session["stepCount"], text[:160], 1)
+            # A pending signal belongs to the preceding native invocation.
+            session.update(idleSignal=None, idleSignalTurnId=None)
+
+        prompt = f"{session['systemPrompt']}\n\n{text}" if session.get("systemPrompt") else text
+        if context:
+            prompt += f"\n\nAdditional context:\n{context}"
+        response = self.codex.turn_start(tid, prompt, cwd=session["cwd"], model=session["model"], effort=session["effort"])
+        turn = response.get("turn") or {}
+        turn_id = turn.get("id")
+        if not turn_id:
+            raise RuntimeError("Codex turn/start did not return a turn ID")
+        with self.lock:
+            if session["status"] == "starting" and session.get("lastTerminalTurnId") != turn_id:
+                session.update(activeTurnId=turn_id, status="working")
+            self._record_event(session, "turn/start", {"turnId": turn_id, "prompt": text[:300]})
+            self._save_state()
+            status = session["status"]
+        return {"action": "turn/start", "conversationId": cid, "threadId": tid, "turnId": turn_id, "status": status}
 
     def _execute_directive(self, session: Dict[str, Any], directive: str, remainder: str) -> Dict[str, Any]:
         conv_id = session["conversationId"]
-        thread_id = session["threadId"]
-        active_turn = session.get("activeTurnId")
+        thread_id = session.get("threadId")
+        with self.lock:
+            active_turn = session.get("activeTurnId")
 
         if directive == "STEER":
-            if not active_turn:
-                # If idle, start a turn instead
-                return self.dispatch_subagent_input(conv_id, remainder)
-            res = self.codex.turn_steer(thread_id=thread_id, expected_turn_id=active_turn, steer_text=remainder)
-            self._record_event(session, "turn/steer", {"turnId": active_turn, "text": remainder[:300]})
-            self._append_transcript_step(
-                session,
-                {
-                    "source": "MODEL",
-                    "type": "PLANNER_RESPONSE",
-                    "status": "DONE",
-                    "model": session.get("model") or "codex",
-                    "thinking": f"**Steered Turn {active_turn}**\n{remainder}",
-                    "tool_calls": [],
-                },
-            )
-            self._save_state()
-            return {"action": "turn/steer", "conversationId": conv_id, "threadId": thread_id, "turnId": active_turn, "result": res}
+            return self._dispatch_turn(session, remainder)
 
         if directive == "QUEUE":
             res = self.codex.thread_queue_add(thread_id=thread_id, text=remainder)
@@ -827,24 +911,43 @@ class UnifiedSubagentBridge:
 
         if directive == "INTERRUPT":
             if active_turn:
-                self.codex.turn_interrupt(thread_id=thread_id, turn_id=active_turn)
                 with self.lock:
-                    session["activeTurnId"] = None
-                    session["status"] = "idle"
-                    session["currentActivity"] = "Interrupted"
-            self._record_event(session, "turn/interrupt", {"turnId": active_turn})
-            self._save_state()
+                    if session.get("activeTurnId") == active_turn:
+                        session["status"] = "interrupting"
+                try:
+                    self.codex.turn_interrupt(thread_id=thread_id, turn_id=active_turn)
+                except Exception:
+                    with self.lock:
+                        if session.get("activeTurnId") == active_turn:
+                            session["status"] = "working"
+                            raise
+                self._record_event(session, "turn/interrupt", {"turnId": active_turn})
+                self._save_state()
+                if remainder:
+                    with self.turn_changed:
+                        finished = self.turn_changed.wait_for(
+                            lambda: session.get("activeTurnId") != active_turn, timeout=10,
+                        )
+                    if not finished:
+                        raise TimeoutError(f"Codex turn {active_turn} has not acknowledged interruption")
             if remainder:
-                return self.dispatch_subagent_input(conv_id, remainder)
-            return {"action": "turn/interrupt", "conversationId": conv_id, "threadId": thread_id, "interruptedTurnId": active_turn}
+                return self._dispatch_turn(session, remainder)
+            return {"action": "turn/interrupt", "conversationId": conv_id, "threadId": thread_id,
+                    "interruptedTurnId": active_turn}
 
         if directive.startswith("REVERT"):
             parts = directive.split(":")
-            turns_to_drop = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+            if active_turn:
+                raise ValueError("Wait for the active turn to complete before reverting")
+            turns_to_drop = max(1, int(parts[1])) if len(parts) > 1 and parts[1].isdigit() else 1
             before_turn_id = self._resolve_before_turn_id(session, turns_to_drop)
             if not before_turn_id:
                 return {"action": "thread/revert", "conversationId": conv_id, "threadId": thread_id, "skipped": "no turns to revert"}
             res = self.codex.thread_revert(thread_id=thread_id, before_turn_id=before_turn_id)
+            with self.lock:
+                history = session.get("turnHistory", [])
+                index = next((i for i, item in enumerate(history) if item.get("turnId") == before_turn_id), 0)
+                del history[index:]
             self._record_event(session, "thread/revert", {"beforeTurnId": before_turn_id, "turnsToDrop": turns_to_drop})
             self._save_state()
             return {"action": "thread/revert", "conversationId": conv_id, "threadId": thread_id, "beforeTurnId": before_turn_id, "result": res}
@@ -852,56 +955,44 @@ class UnifiedSubagentBridge:
         if directive == "COMPACT":
             res = self.codex.thread_compact_start(thread_id=thread_id)
             self._record_event(session, "thread/compact/start", {})
+            self._save_state()
             return {"action": "thread/compact/start", "conversationId": conv_id, "threadId": thread_id, "result": res}
 
-        if directive.startswith("MODEL:"):
-            new_model = directive.split(":", 1)[1].strip()
-            with self.lock:
-                session["model"] = new_model
-            res = None
-            if active_turn:
-                res = self.codex.turn_settings_update(thread_id=thread_id, turn_id=active_turn, model=new_model)
-            self._save_state()
+        if directive.startswith(("MODEL:", "EFFORT:")):
+            key, value = directive.split(":", 1)
+            key = key.lower()
+            value = value.strip().lower() if key == "effort" else value.strip()
+            result = self.configure_subagent(conv_id, **{key: value})
             if remainder:
-                return self.dispatch_subagent_input(conv_id, remainder)
-            return {"action": "turn/settings/update", "model": new_model, "result": res}
-
-        if directive.startswith("EFFORT:"):
-            new_effort = directive.split(":", 1)[1].strip().lower()
-            with self.lock:
-                session["effort"] = new_effort
-            res = None
-            if active_turn:
-                res = self.codex.turn_settings_update(thread_id=thread_id, turn_id=active_turn, effort=new_effort)
-            self._save_state()
-            if remainder:
-                return self.dispatch_subagent_input(conv_id, remainder)
-            return {"action": "turn/settings/update", "effort": new_effort, "result": res}
+                return self._dispatch_turn(session, remainder)
+            return {"action": "turn/settings/update", key: value, "result": result.get("settingsUpdate")}
 
         if directive in ("APPROVE", "DECLINE"):
             decision = "accept" if directive == "APPROVE" else "decline"
             resolved = self.resolve_pending_approvals_for_conversation(conv_id, decision=decision)
             return {"action": "approval", "decision": decision, "resolvedCount": resolved}
 
-        return self.dispatch_subagent_input(conv_id, remainder)
+        raise ValueError(f"Unrecognized directive {directive}")
 
     def _resolve_before_turn_id(self, session: Dict[str, Any], turns_to_drop: int = 1) -> Optional[str]:
-        thread_id = session.get("threadId")
-        history = session.get("turnHistory") or []
+        with self.lock:
+            thread_id = session.get("threadId")
+            history = list(session.get("turnHistory") or [])
         if len(history) >= turns_to_drop:
             cand = history[-turns_to_drop].get("turnId")
             if cand:
                 return str(cand)
         if thread_id:
             try:
-                t_read = self.codex.thread_read(thread_id=thread_id, include_turns=True)
-                turns = (t_read.get("thread") or {}).get("turns") or []
+                response = self.codex.request("thread/turns/list", {
+                    "threadId": thread_id, "sortDirection": "desc", "limit": max(1, turns_to_drop),
+                })
+                turns = response.get("data") or []
                 if turns:
-                    idx = max(0, len(turns) - turns_to_drop)
-                    return turns[idx].get("id")
+                    return turns[min(len(turns), turns_to_drop) - 1].get("id")
             except Exception as e:
                 logger.warning("thread_read during revert failed: %s", e)
-        return session.get("activeTurnId")
+        return None
 
     def _record_event(self, session: Dict[str, Any], event_type: str, data: Dict[str, Any]) -> None:
         with self.lock:
@@ -915,26 +1006,59 @@ class UnifiedSubagentBridge:
     # -------------------------------------------------------------------------
 
     def _on_codex_notification(self, method: str, params: Dict[str, Any]) -> None:
-        thread_id = params.get("threadId")
-        if not thread_id:
+        if method == "bridge/disconnected":
+            with self.lock:
+                for tid, connection in list(self._thread_connections.items()):
+                    if connection is params["connection"]:
+                        session = self.sessions_by_conv[self.conv_by_thread[tid]]
+                        self._clear_disconnected_turn(session)
+                        self._thread_connections.pop(tid, None)
+                self._save_state()
             return
+
+        thread_id = params.get("threadId")
         with self.lock:
             conv_id = self.conv_by_thread.get(thread_id)
             session = self.sessions_by_conv.get(conv_id) if conv_id else None
-        if not session or not conv_id:
-            return
+            if not session or session["status"] == "killed":
+                return
+            self._apply_codex_notification(session, method, params)
 
-        if method == "turn/started":
-            turn = params.get("turn") or {}
-            turn_id = turn.get("id")
-            with self.lock:
-                session["activeTurnId"] = turn_id
-                session["status"] = "working"
-                session["currentActivity"] = "Thinking..."
-                session["activityKind"] = "thinking"
-                session["updatedAt"] = utc_now_iso()
-            self._record_event(session, "turn/started", {"turnId": turn_id})
+    def _apply_codex_notification(self, session: Dict[str, Any], method: str, params: Dict[str, Any]) -> None:
+        # Ordered callback worker and state lock. RPC, process waits, and LS HTTP belong outside it.
+        thread_id = session["threadId"]
+        turn = params.get("turn") or {}
+        turn_id = turn.get("id") or params.get("turnId")
+        active = session.get("activeTurnId")
+        if method == "serverRequest/resolved":
+            for aid, approval in list(self.pending_approvals.items()):
+                if approval["threadId"] == thread_id and approval["rpcRequestId"] == params.get("requestId"):
+                    self._remove_approval(aid)
+            self._refresh_approval_status(session)
             return
+        if not turn_id and not active:
+            return
+        if turn_id and turn_id == session.get("lastTerminalTurnId"):
+            return
+        if active and turn_id and active != turn_id:
+            return
+        if method == "turn/started":
+            if not active and session["status"] != "starting":
+                session.update(lastAgentMessage="", lastThinking="", latestDiff="", plan=[], planExplanation="")
+            session["activeTurnId"] = turn_id
+            if session["status"] not in ("awaiting_approval", "interrupting"):
+                session.update(status="working", currentActivity="Thinking...", activityKind="thinking")
+            session["updatedAt"] = utc_now_iso()
+            self._record_event(session, "turn/started", {"turnId": turn_id})
+            self._save_state()
+            return
+        if method == "turn/completed":
+            if active or session["status"] == "starting":
+                self._on_turn_completed(session, turn)
+            return
+        if not active:
+            return
+        item_key = (thread_id, active, (params.get("item") or {}).get("id") or params.get("itemId"))
 
         if method == "turn/diff/updated":
             diff_text = params.get("diff") or ""
@@ -968,8 +1092,8 @@ class UnifiedSubagentBridge:
             item_id = params.get("itemId", "")
             delta = params.get("delta", "")
             with self.lock:
-                buf = self._item_buffers.setdefault(item_id, {"type": "reasoning", "text": ""})
-                buf["text"] += delta
+                buf = self._item_buffers.setdefault(item_key, {"type": "reasoning", "text": ""})
+                buf["text"] = (buf["text"] + delta)[-16000:]
                 full_thinking = buf["text"].strip()
                 session["lastThinking"] = full_thinking[-2000:]
                 lines = [ln.strip("*# ") for ln in full_thinking.splitlines() if ln.strip()]
@@ -982,7 +1106,7 @@ class UnifiedSubagentBridge:
             item_id = params.get("itemId", "")
             delta = params.get("delta", "")
             with self.lock:
-                buf = self._item_buffers.setdefault(item_id, {"type": "agentMessage", "text": ""})
+                buf = self._item_buffers.setdefault(item_key, {"type": "agentMessage", "text": ""})
                 buf["text"] += delta
                 session["lastAgentMessage"] = buf["text"]
             return
@@ -991,7 +1115,7 @@ class UnifiedSubagentBridge:
             item_id = params.get("itemId", "")
             delta = params.get("delta", "")
             with self.lock:
-                buf = self._item_buffers.setdefault(item_id, {"type": "output", "output": ""})
+                buf = self._item_buffers.setdefault(item_key, {"type": "output", "output": ""})
                 buf["output"] = (buf.get("output", "") + delta)[-16000:]
             return
 
@@ -1008,7 +1132,7 @@ class UnifiedSubagentBridge:
                 with self.lock:
                     session["currentActivity"] = summary_label
                     session["activityKind"] = "tool"
-                    self._item_buffers[item_id] = {"type": "commandExecution", "command": cmd_str, "output": ""}
+                    self._item_buffers[item_key] = {"type": "commandExecution", "command": cmd_str, "output": ""}
                 self._append_transcript_step(
                     session,
                     {
@@ -1039,7 +1163,7 @@ class UnifiedSubagentBridge:
                 with self.lock:
                     session["currentActivity"] = summary_label
                     session["activityKind"] = "tool"
-                    self._item_buffers[item_id] = {"type": "fileChange", "path": first_path, "output": ""}
+                    self._item_buffers[item_key] = {"type": "fileChange", "path": first_path, "output": ""}
                 self._append_transcript_step(
                     session,
                     {
@@ -1091,7 +1215,7 @@ class UnifiedSubagentBridge:
             item = params.get("item") or {}
             item_id = item.get("id", "")
             item_type = item.get("type", "")
-            buf = self._item_buffers.pop(item_id, {})
+            buf = self._item_buffers.pop(item_key, {})
 
             if item_type == "reasoning":
                 summary_list = item.get("summary") or []
@@ -1147,90 +1271,136 @@ class UnifiedSubagentBridge:
                 )
             return
 
-        if method == "turn/completed":
-            turn = params.get("turn") or {}
-            turn_id = turn.get("id", "")
-            turn_status = turn.get("status", "completed")
-            turn_error = turn.get("error")
+    def _on_turn_completed(self, session: Dict[str, Any], turn: Dict[str, Any]) -> None:
+        conv_id, thread_id = session["conversationId"], session["threadId"]
+        turn_id = turn["id"]
+        result = turn.get("status", "completed")
+        error = turn.get("error")
+        message = session.get("lastAgentMessage", "").strip()
+        thinking = session.get("lastThinking", "").strip()
+        latest_diff = session.get("latestDiff", "").strip()
+        plan = session.get("plan") or []
+        role = session.get("role") or "Codex Subagent"
+        parent = session.get("parentConversationId", "")
+        credentials = self._session_credentials(session)
 
+        self._clear_turn_resources(thread_id, turn_id)
+        status = {"failed": "error", "interrupted": "interrupted"}.get(result, "idle")
+        session.update(
+            activeTurnId=None, lastTerminalTurnId=turn_id, status=status, activityKind="",
+            currentActivity=f"Failed: {error}" if error else f"Turn {result}",
+        )
+        session.setdefault("turnHistory", []).append({
+            "turnId": turn_id, "status": result, "completedAt": utc_now_iso(), "summary": message[:500],
+        })
+        self._record_event(session, "turn/completed", {"turnId": turn_id, "status": result})
+        try:
+            self._append_transcript_step(session, {
+                "source": "MODEL", "type": "PLANNER_RESPONSE",
+                "status": "ERROR" if result == "failed" else "DONE",
+                "model": session.get("model") or "codex", "thinking": thinking,
+                "response": message or (f"Error: {error}" if error else f"Turn {result}"),
+                "tool_calls": [], **({"error": json.dumps(error)} if error else {}),
+            })
+        except OSError:
+            logger.exception("Failed to write completed turn %s to the transcript", turn_id)
+        self._sync_sqlite_status(
+            conv_id, "CASCADE_RUN_STATUS_IDLE", session["stepCount"], message or f"Turn {result}",
+        )
+        self._schedule_sdk_idle(session, turn_id)
+        self._save_state()
+        self.turn_changed.notify_all()
+
+        if parent:
+            report = [
+                f"### Codex Subagent Report (`{role}`)",
+                f"- **Subagent Conversation**: [{role}](conversation://{conv_id})",
+                f"- **Codex Thread / Turn**: `{thread_id}` / `{turn_id}` (`{result}`)",
+            ]
+            if plan:
+                report.extend(
+                    f"- [{'x' if entry.get('status') == 'completed' else ' '}] {entry.get('step', '')}"
+                    for entry in plan if isinstance(entry, dict)
+                )
+            if message:
+                report.append(f"\n{message}")
+            if error:
+                report.append(f"\n**Error Details**: `{json.dumps(error)}`")
+            if latest_diff:
+                lines = latest_diff.splitlines()
+                excerpt = "\n".join(lines[:60])
+                if len(lines) > 60:
+                    excerpt += f"\n… ({len(lines) - 60} more lines)"
+                report.append(f"\n<details><summary>Unified Diff Summary ({len(lines)} lines)</summary>"
+                              f"\n\n```diff\n{excerpt}\n```\n</details>")
+            threading.Thread(
+                target=self.send_message_to_agy_conversation,
+                kwargs={"recipient_id": parent, "sender_id": conv_id,
+                        "title": f"Codex Subagent ({role}) Turn Completed", "content": "\n".join(report),
+                        **credentials},
+                name="codex-parent-report", daemon=True,
+            ).start()
+
+    def _session_credentials(self, session: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        return {"ls_address": session.get("lsAddress") or self.ls_address,
+                "csrf_token": session.get("csrfToken", self.csrf_token)}
+
+    def _schedule_sdk_idle(self, session: Dict[str, Any], turn_id: Optional[str]) -> None:
+        if not session.get("sdkInstanceId") or not session.get("lsAddress"):
+            return
+        session.update(idleSignal="pending", idleSignalTurnId=turn_id)
+        threading.Thread(
+            target=self._signal_sdk_idle, args=(session, turn_id, session["sdkInstanceId"]),
+            name="codex-sdk-idle", daemon=True,
+        ).start()
+
+    def _signal_sdk_idle(self, session: Dict[str, Any], turn_id: Optional[str], instance: str) -> None:
+        conversation_id = session["conversationId"]
+        with self._conversation_lock(conversation_id):
             with self.lock:
-                final_msg = session.get("lastAgentMessage", "").strip()
-                final_thinking = session.get("lastThinking", "").strip()
-                latest_diff = session.get("latestDiff", "").strip()
-                plan = session.get("plan") or []
-                role = session.get("role", "Codex Subagent")
-                parent_id = session.get("parentConversationId", "")
+                if (session.get("sdkInstanceId") != instance or session.get("idleSignalTurnId") != turn_id
+                        or session.get("idleSignal") != "pending" or session.get("activeTurnId")):
+                    return
+                credentials = self._session_credentials(session)
+            try:
+                self.lsrpc("SignalExecutableIdle", {"conversationId": conversation_id}, timeout=2, **credentials)
+                signal_status = "sent"
+            except Exception as e:
+                logger.warning("Could not signal SDK executable idle for %s: %s", conversation_id, e)
+                signal_status = "failed"
+            with self.lock:
+                session["idleSignal"] = signal_status
+                self._save_state()
 
-                session["activeTurnId"] = None
-                session["status"] = "error" if turn_status == "failed" else "idle"
-                session["currentActivity"] = (
-                    f"Failed: {turn_error}" if turn_status == "failed" else "Idle (turn completed)"
-                )
-                session["activityKind"] = ""
-                session.setdefault("turnHistory", []).append(
-                    {
-                        "turnId": turn_id,
-                        "status": turn_status,
-                        "completedAt": utc_now_iso(),
-                        "summary": final_msg[:500],
-                    }
-                )
-                self._record_event(session, "turn/completed", {"turnId": turn_id, "status": turn_status})
+    def _clear_disconnected_turn(self, session: Dict[str, Any]) -> None:
+        thread_id = session["threadId"]
+        turn_id = session.get("activeTurnId")
+        self._clear_turn_resources(thread_id)
+        if turn_id or session["status"] == "starting":
+            session.update(status="error", activeTurnId=None, lastTerminalTurnId=turn_id,
+                           currentActivity="Codex connection lost", activityKind="")
+            self._record_event(session, "bridge/disconnected", {"turnId": turn_id})
+            self._sync_sqlite_status(session["conversationId"], "CASCADE_RUN_STATUS_IDLE", session["stepCount"])
+            self._schedule_sdk_idle(session, turn_id)
+            self.turn_changed.notify_all()
 
-            step_idx = self._append_transcript_step(
-                session,
-                {
-                    "source": "MODEL",
-                    "type": "PLANNER_RESPONSE",
-                    "status": "ERROR" if turn_status == "failed" else "DONE",
-                    "model": session.get("model") or "codex",
-                    "thinking": final_thinking,
-                    "response": final_msg or (f"Turn {turn_status}" if not turn_error else f"Error: {turn_error}"),
-                    "tool_calls": [],
-                    **({"error": json.dumps(turn_error)} if turn_error else {}),
-                },
-            )
-            self._sync_sqlite_status(
-                conv_id,
-                status="CASCADE_RUN_STATUS_IDLE",
-                step_count=step_idx + 1,
-                preview=(final_msg or f"Turn {turn_status}")[:200],
-                not_fully_idle=0,
-            )
-            self._save_state()
+    def _clear_turn_resources(self, thread_id: str, turn_id: Optional[str] = None) -> None:
+        for key in list(self._item_buffers):
+            if key[0] == thread_id and (turn_id is None or key[1] == turn_id):
+                self._item_buffers.pop(key)
+        for aid, approval in list(self.pending_approvals.items()):
+            if approval["threadId"] == thread_id and (turn_id is None or approval["turnId"] == turn_id):
+                self._remove_approval(aid)
 
-            # Deliver final message back to parent conversation to trigger Reactive Wakeup!
-            if parent_id:
-                report_parts = [
-                    f"### Codex Subagent Report (`{role}`)",
-                    f"- **Subagent Conversation**: [{role}](conversation://{conv_id})",
-                    f"- **Codex Thread / Turn**: `{thread_id}` / `{turn_id}` (`{turn_status}`)",
-                ]
-                if plan:
-                    plan_md = "\n".join(
-                        f"  - `[{'x' if p.get('status') == 'completed' else ' '}]` {p.get('step', '')}"
-                        for p in plan
-                        if isinstance(p, dict)
-                    )
-                    report_parts.append(f"- **Execution Plan**:\n{plan_md}")
-                if final_msg:
-                    report_parts.append(f"\n{final_msg}")
-                if turn_error:
-                    report_parts.append(f"\n**Error Details**: `{json.dumps(turn_error)}`")
-                if latest_diff:
-                    diff_lines = latest_diff.splitlines()
-                    preview_diff = "\n".join(diff_lines[:60])
-                    if len(diff_lines) > 60:
-                        preview_diff += f"\n... ({len(diff_lines) - 60} more diff lines; use `subagent_inspect` to view full diff)"
-                    report_parts.append(f"\n<details><summary>Unified Diff Summary ({len(diff_lines)} lines)</summary>\n\n```diff\n{preview_diff}\n```\n</details>")
+    def _remove_approval(self, approval_id: str) -> None:
+        self.pending_approvals.pop(approval_id, None)
+        self._approval_replies.pop(approval_id, None)
 
-                full_report = "\n".join(report_parts)
-                self.send_message_to_agy_conversation(
-                    recipient_id=parent_id,
-                    sender_id=conv_id,
-                    title=f"Codex Subagent ({role}) Turn Completed",
-                    content=full_report,
-                )
+    def _refresh_approval_status(self, session: Dict[str, Any]) -> None:
+        if session["status"] == "awaiting_approval" and not any(
+            item["conversationId"] == session["conversationId"] for item in self.pending_approvals.values()
+        ):
+            session.update(status="working", currentActivity="Running Codex turn...")
 
     # -------------------------------------------------------------------------
     # Codex ServerRequest Handler (Approvals & Dynamic Tools)
@@ -1241,11 +1411,13 @@ class UnifiedSubagentBridge:
         req_id: int | str,
         method: str,
         params: Dict[str, Any],
+        reply: Callable[..., None],
     ) -> Optional[Dict[str, Any]]:
         thread_id = params.get("threadId", "")
         with self.lock:
             conv_id = self.conv_by_thread.get(thread_id, "")
-            session = self.sessions_by_conv.get(conv_id) if conv_id else None
+            live_session = self.sessions_by_conv.get(conv_id) if conv_id else None
+            session = dict(live_session) if live_session else None
 
         # 1. Dynamic tool call from Codex back into Antigravity!
         if method == "item/tool/call":
@@ -1259,7 +1431,7 @@ class UnifiedSubagentBridge:
 
             if tool_name == "agy_notify_parent":
                 msg_text = str(args.get("message", ""))
-                title = str(args.get("title") or f"Codex Subagent Interim Update")
+                title = str(args.get("title") or "Codex Subagent Interim Update")
                 parent_id = session.get("parentConversationId", "") if session else ""
                 if parent_id and msg_text:
                     res = self.send_message_to_agy_conversation(
@@ -1267,6 +1439,7 @@ class UnifiedSubagentBridge:
                         sender_id=conv_id or None,
                         title=title,
                         content=f"**[Codex Interim Notification (`{thread_id}`)]**\n\n{msg_text}",
+                        **self._session_credentials(session),
                     )
                     return {
                         "success": bool(res.get("sent")),
@@ -1306,62 +1479,53 @@ class UnifiedSubagentBridge:
             "item/fileChange/requestApproval",
             "item/permissions/requestApproval",
         ):
-            approval_mode = session.get("approvalMode", "auto_accept") if session else "auto_accept"
-            if approval_mode == "auto_accept":
-                if method == "item/permissions/requestApproval":
-                    return {"permissions": params.get("permissions", {}), "scope": "turn"}
-                return {"decision": "accept"}
-
-            # Hold request in pending_approvals for interactive UI / parent approval
-            approval_id = f"appr_{uuid.uuid4().hex[:10]}"
             with self.lock:
+                active = live_session.get("activeTurnId") if live_session else None
+                turn_id = params.get("turnId") or active
+                if not live_session or not active or active != turn_id or live_session["status"] == "interrupting":
+                    return self._approval_result(method, params, "decline")
+                if live_session.get("approvalMode") == "auto_accept":
+                    return self._approval_result(method, params, "accept")
+
+                approval_id = f"appr_{uuid.uuid4().hex[:10]}"
                 self.pending_approvals[approval_id] = {
-                    "approvalId": approval_id,
-                    "rpcRequestId": req_id,
-                    "method": method,
-                    "params": params,
-                    "conversationId": conv_id,
-                    "threadId": thread_id,
-                    "createdAt": utc_now_iso(),
+                    "approvalId": approval_id, "rpcRequestId": req_id, "method": method, "params": params,
+                    "conversationId": conv_id, "threadId": thread_id, "turnId": turn_id, "createdAt": utc_now_iso(),
                 }
-                if session:
-                    session["status"] = "awaiting_approval"
-                    session["currentActivity"] = f"Awaiting approval ({method.split('/')[1]})"
-            return None  # Hold open asynchronously until resolve_approval is called
+                self._approval_replies[approval_id] = reply
+                live_session.update(status="awaiting_approval", currentActivity=f"Awaiting approval ({method.split('/')[1]})")
+            return None
 
         return {}
 
+    @staticmethod
+    def _approval_result(method: str, params: Dict[str, Any], decision: str) -> Dict[str, Any]:
+        if method == "item/permissions/requestApproval":
+            return {"permissions": params.get("permissions", {}) if decision == "accept" else {}, "scope": "turn"}
+        return {"decision": decision}
+
     def resolve_pending_approvals_for_conversation(
-        self,
-        conversation_id: str,
-        decision: str = "accept",
-        approval_id: Optional[str] = None,
+        self, conversation_id: str, decision: str = "accept", approval_id: Optional[str] = None,
     ) -> int:
+        if decision not in ("accept", "decline", "cancel"):
+            raise ValueError("Invalid approval decision")
+        with self.lock:
+            replies = []
+            for aid, item in list(self.pending_approvals.items()):
+                if item["conversationId"] == conversation_id and (approval_id is None or aid == approval_id):
+                    replies.append((self._approval_replies[aid], item))
+                    self._remove_approval(aid)
+            session = self.sessions_by_conv.get(conversation_id)
+            if session:
+                self._refresh_approval_status(session)
+
         count = 0
-        with self.lock:
-            to_resolve = [
-                aid
-                for aid, item in self.pending_approvals.items()
-                if (approval_id and aid == approval_id)
-                or (not approval_id and item.get("conversationId") == conversation_id)
-            ]
-        for aid in to_resolve:
-            with self.lock:
-                item = self.pending_approvals.pop(aid, None)
-            if not item:
-                continue
-            method = item["method"]
-            req_id = item["rpcRequestId"]
-            if method == "item/permissions/requestApproval":
-                result = {"permissions": item["params"].get("permissions", {}) if decision == "accept" else {}, "scope": "turn"}
-            else:
-                result = {"decision": decision}
-            self.codex.respond_to_server_request(req_id, result=result)
-            count += 1
-        with self.lock:
-            sess = self.sessions_by_conv.get(conversation_id)
-            if sess and sess.get("status") == "awaiting_approval":
-                sess["status"] = "working"
+        for reply, item in replies:
+            try:
+                reply(result=self._approval_result(item["method"], item["params"], decision))
+                count += 1
+            except OSError:
+                logger.debug("Approval %s closed before delivery", item["approvalId"])
         return count
 
     # -------------------------------------------------------------------------
@@ -1382,23 +1546,26 @@ class UnifiedSubagentBridge:
         """
         items_by_conv: Dict[str, Dict[str, Any]] = {}
 
+        with self.lock:
+            codex_names = {"codex", *self.profiles}
+            codex_ids = set(self.sessions_by_conv)
+
         # 1. Scan conversation_summaries.db across appDataDirs
         for app_dir in find_app_data_dirs():
             db_path = app_dir / "conversation_summaries.db"
             if not db_path.exists():
                 continue
             try:
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT conversation_id, title, preview, step_count, last_modified_time, "
-                    "workspace_uris, status, agent_name, parent_conversation_id, nesting_depth, "
-                    "not_fully_idle, killed, raw_summary "
-                    "FROM conversation_summaries "
-                    "WHERE parent_conversation_id != '' OR agent_name != '' "
-                    "ORDER BY last_modified_time DESC LIMIT 100"
-                ).fetchall()
-                conn.close()
+                with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT conversation_id, title, preview, step_count, last_modified_time, "
+                        "workspace_uris, status, agent_name, parent_conversation_id, nesting_depth, "
+                        "not_fully_idle, killed, raw_summary "
+                        "FROM conversation_summaries "
+                        "WHERE parent_conversation_id != '' OR agent_name != '' "
+                        "ORDER BY last_modified_time DESC LIMIT 100"
+                    ).fetchall()
                 for r in rows:
                     d = dict(r)
                     cid = d["conversation_id"]
@@ -1425,7 +1592,7 @@ class UnifiedSubagentBridge:
                                     model_opt = m_cand
 
                     agent_name = d.get("agent_name") or "subagent"
-                    engine = "codex" if agent_name == "codex" or cid in self.sessions_by_conv else "gemini"
+                    engine = "codex" if agent_name in codex_names or cid in codex_ids else "gemini"
                     tp = app_dir / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
                     tr = summarize_transcript_file(tp, max_steps=15)
 
@@ -1478,7 +1645,7 @@ class UnifiedSubagentBridge:
 
         # 2. Overlay Codex Bridge sessions (authoritative for Codex subagents)
         with self.lock:
-            sessions_copy = list(self.sessions_by_conv.values())
+            sessions_copy = [dict(session) for session in self.sessions_by_conv.values()]
             approvals_copy = list(self.pending_approvals.values())
 
         for sess in sessions_copy:
@@ -1495,7 +1662,8 @@ class UnifiedSubagentBridge:
                 "parentConversationId": parent_id or existing.get("parentConversationId", ""),
                 "nestingDepth": existing.get("nestingDepth", 1),
                 "engine": "codex",
-                "agentName": "codex",
+                "agentName": sess.get("agentName", "codex"),
+                "executionMode": sess.get("executionMode", "preInvocation"),
                 "role": sess.get("role") or existing.get("role") or "Codex Engineer",
                 "model": sess.get("model") or existing.get("model") or "gpt-5.4",
                 "effort": sess.get("effort") or "high",
@@ -1521,7 +1689,7 @@ class UnifiedSubagentBridge:
         subagents.sort(
             key=lambda x: (
                 0 if x.get("matchesActiveConversation") else 1,
-                0 if x.get("status") in ("working", "awaiting_approval") else 1,
+                0 if x.get("status") in ("starting", "working", "interrupting", "awaiting_approval") else 1,
                 x.get("updatedAt", ""),
             ),
             reverse=False,
@@ -1539,13 +1707,14 @@ class UnifiedSubagentBridge:
         Detailed non-blocking inspection of EITHER a Codex subagent OR a Gemini native subagent.
         Returns transcript steps, live thinking, tool calls, unified file diffs, and plan checklist.
         """
+        self._validate_conversation_id(conversation_id)
         roster = self.list_unified_subagents(include_all=True)
         summary = next(
             (s for s in roster["subagents"] if s["conversationId"] == conversation_id),
             None,
         )
         with self.lock:
-            codex_sess = self.sessions_by_conv.get(conversation_id)
+            codex_sess = copy.deepcopy(self.sessions_by_conv.get(conversation_id))
 
         tp = (
             self._transcript_path_for(codex_sess)
@@ -1630,16 +1799,7 @@ class UnifiedSubagentBridge:
                 return self.dispatch_subagent_input(conversation_id, f"[QUEUE] {message}")
             if mode == "interrupt_and_steer":
                 return self.dispatch_subagent_input(conversation_id, f"[INTERRUPT] {message}")
-            if additional_context and codex_sess.get("activeTurnId") and codex_sess.get("threadId"):
-                res = self.codex.turn_steer(
-                    thread_id=codex_sess["threadId"],
-                    expected_turn_id=codex_sess["activeTurnId"],
-                    steer_text=message,
-                    additional_context=additional_context,
-                )
-                self._record_event(codex_sess, "turn/steer", {"text": message[:300]})
-                return {"engine": "codex", "action": "turn/steer", "conversationId": conversation_id, "result": res}
-            return self.dispatch_subagent_input(conversation_id, message)
+            return self.dispatch_subagent_input(conversation_id, message, additional_context=additional_context)
 
         # Gemini native subagent steering via LanguageServerService
         db_meta = self.query_db_conversation_meta(conversation_id)
@@ -1669,13 +1829,15 @@ class UnifiedSubagentBridge:
             "result": send_res,
         }
 
-    def interrupt_subagent(self, conversation_id: str) -> Dict[str, Any]:
-        """Interrupts the active turn/invocation of either a Codex or Gemini subagent without killing it."""
-        with self.lock:
-            codex_sess = self.sessions_by_conv.get(conversation_id)
-
-        if codex_sess and codex_sess.get("threadId"):
-            return self._execute_directive(codex_sess, "INTERRUPT", "")
+    def interrupt_subagent(self, conversation_id: str, sdk_instance: Optional[str] = None) -> Dict[str, Any]:
+        """Interrupt a Codex turn or a native Gemini invocation."""
+        with self._conversation_lock(conversation_id):
+            with self.lock:
+                session = self.sessions_by_conv.get(conversation_id)
+                if sdk_instance and (not session or sdk_instance != session.get("sdkInstanceId")):
+                    raise ValueError("SDK executor registration is no longer current")
+            if session:
+                return self._execute_directive(session, "INTERRUPT", "")
 
         # Gemini native subagent: call CancelCascadeInvocation
         res = self.lsrpc(
@@ -1686,32 +1848,35 @@ class UnifiedSubagentBridge:
 
     def kill_subagent(self, conversation_id: str) -> Dict[str, Any]:
         """Terminates a Codex or Gemini subagent permanently."""
-        with self.lock:
-            codex_sess = self.sessions_by_conv.get(conversation_id)
-
         results: Dict[str, Any] = {"conversationId": conversation_id}
-        if codex_sess and codex_sess.get("threadId"):
-            tid = codex_sess["threadId"]
-            active_turn = codex_sess.get("activeTurnId")
-            if active_turn:
-                try:
-                    self.codex.turn_interrupt(thread_id=tid, turn_id=active_turn)
-                except Exception:
-                    pass
-            try:
-                self.codex.thread_unsubscribe(thread_id=tid)
-            except Exception:
-                pass
+        with self._conversation_lock(conversation_id):
             with self.lock:
-                codex_sess["activeTurnId"] = None
-                codex_sess["status"] = "killed"
-                codex_sess["currentActivity"] = "Killed"
-                self._save_state()
-            results["codex"] = "terminated"
+                session = self.sessions_by_conv.get(conversation_id)
+                tid = session.get("threadId") if session else None
+                credentials = self._session_credentials(session or {})
+            if session:
+                try:
+                    self._execute_directive(session, "INTERRUPT", "")
+                except Exception as e:
+                    results["codexError"] = str(e)
+                if tid:
+                    try:
+                        self.codex.thread_unsubscribe(tid)
+                    except Exception as e:
+                        results["unsubscribeError"] = str(e)
+                with self.lock:
+                    if tid:
+                        self._clear_turn_resources(tid)
+                        self._thread_connections.pop(tid, None)
+                        self.conv_by_thread.pop(tid, None)
+                    session.update(activeTurnId=None, status="killed", currentActivity="Killed", activityKind="")
+                    self._save_state()
+                    self.turn_changed.notify_all()
+                results["codex"] = "interrupt_failed" if "codexError" in results else "terminated"
 
-        if self.ls_address:
+        if credentials["ls_address"]:
             try:
-                results["lsForceStop"] = self.lsrpc("ForceStopCascadeTree", {"conversationId": conversation_id})
+                results["lsForceStop"] = self.lsrpc("ForceStopCascadeTree", {"conversationId": conversation_id}, **credentials)
             except Exception as e:
                 results["lsForceStopError"] = str(e)
         return results
@@ -1726,7 +1891,7 @@ class UnifiedSubagentBridge:
             codex_sess = self.sessions_by_conv.get(conversation_id)
 
         if codex_sess and codex_sess.get("threadId"):
-            return self._execute_directive(codex_sess, f"REVERT:{max(1, step_or_turns)}", "")
+            return self.dispatch_subagent_input(conversation_id, f"[REVERT:{max(1, step_or_turns)}]")
 
         res = self.lsrpc(
             "RevertToCascadeStep",
@@ -1754,35 +1919,36 @@ class UnifiedSubagentBridge:
             codex_sess = self.sessions_by_conv.get(conversation_id)
 
         if codex_sess and codex_sess.get("threadId"):
-            fork_res = self.codex.thread_fork(
-                thread_id=codex_sess["threadId"],
-                before_turn_id=before_turn_id,
-                cwd=codex_sess.get("cwd"),
-            )
-            new_thread = (fork_res.get("thread") or {}).get("id")
-            new_conv_id = f"codex-fork-{uuid.uuid4().hex[:12]}"
-            with self.lock:
-                self.sessions_by_conv[new_conv_id] = {
-                    **codex_sess,
-                    "conversationId": new_conv_id,
-                    "threadId": new_thread,
-                    "activeTurnId": None,
-                    "role": new_role or f"{codex_sess.get('role', 'Codex')} (Fork)",
-                    "status": "idle",
-                    "createdAt": utc_now_iso(),
-                    "updatedAt": utc_now_iso(),
-                }
-                if new_thread:
+            with self._conversation_lock(conversation_id):
+                self._ensure_thread(codex_sess)
+                result = self.codex.thread_fork(
+                    thread_id=codex_sess["threadId"], before_turn_id=before_turn_id, cwd=codex_sess.get("cwd"),
+                )
+                new_thread = (result.get("thread") or {}).get("id")
+                if not new_thread:
+                    raise RuntimeError("Codex thread/fork did not return a thread ID")
+                new_conv_id = f"codex-fork-{uuid.uuid4().hex[:12]}"
+                with self.lock:
+                    fields = ("agentName", "parentConversationId", "engine", "model", "effort", "sandbox",
+                              "approvalPolicy", "approvalMode", "systemPrompt", "cwd")
+                    history = codex_sess.get("turnHistory", [])
+                    limit = next((i for i, entry in enumerate(history) if entry["turnId"] == before_turn_id), len(history))
+                    self.sessions_by_conv[new_conv_id] = {
+                        **{key: codex_sess[key] for key in fields if key in codex_sess},
+                        "conversationId": new_conv_id, "threadId": new_thread, "activeTurnId": None,
+                        "role": new_role or f"{codex_sess.get('role', 'Codex')} (Fork)",
+                        "status": "idle", "executionMode": "preInvocation",
+                        "stepCount": 0, "nextStepIndex": 0, "events": [],
+                        "turnHistory": copy.deepcopy(history[:limit]),
+                        "createdAt": utc_now_iso(), "updatedAt": utc_now_iso(),
+                    }
                     self.conv_by_thread[new_thread] = new_conv_id
-                self._save_state()
-            if prompt and new_thread:
+                    self._thread_connections[new_thread] = self.codex.connection
+                    self._save_state()
+            if prompt:
                 self.dispatch_subagent_input(new_conv_id, prompt)
-            return {
-                "action": "thread/fork",
-                "sourceConversationId": conversation_id,
-                "newConversationId": new_conv_id,
-                "newThreadId": new_thread,
-            }
+            return {"action": "thread/fork", "sourceConversationId": conversation_id,
+                    "newConversationId": new_conv_id, "newThreadId": new_thread}
 
         # Cross-engine fork: Gemini subagent -> Codex thread!
         return self.handoff_subagent(
@@ -1859,33 +2025,35 @@ class UnifiedSubagentBridge:
         approval_mode: Optional[str] = None,
         compact: bool = False,
     ) -> Dict[str, Any]:
-        with self.lock:
-            codex_sess = self.sessions_by_conv.get(conversation_id)
-        if not codex_sess:
-            raise ValueError(f"Conversation {conversation_id} is not a Codex subagent session")
-
-        tid = codex_sess.get("threadId")
-        active_turn = codex_sess.get("activeTurnId")
-        out: Dict[str, Any] = {"conversationId": conversation_id, "threadId": tid}
-        with self.lock:
-            if model is not None:
-                codex_sess["model"] = model
-            if effort is not None:
-                codex_sess["effort"] = effort
-            if approval_mode in ("auto_accept", "interactive"):
-                codex_sess["approvalMode"] = approval_mode
-            self._save_state()
-
-        if tid and active_turn and (model is not None or effort is not None):
-            out["settingsUpdate"] = self.codex.turn_settings_update(
-                thread_id=tid,
-                turn_id=active_turn,
-                model=model,
-                effort=effort,
-            )
-        if tid and compact:
-            out["compact"] = self.codex.thread_compact_start(thread_id=tid)
-        return out
+        with self._conversation_lock(conversation_id):
+            with self.lock:
+                session = self.sessions_by_conv.get(conversation_id)
+                if not session:
+                    raise ValueError(f"Conversation {conversation_id} is not a Codex subagent session")
+                if effort is not None and effort not in ("low", "medium", "high", "xhigh", "ultra"):
+                    raise ValueError("Invalid reasoning effort")
+                if model is not None and (not isinstance(model, str) or not model.strip()):
+                    raise ValueError("Invalid model")
+                tid, turn_id = session.get("threadId"), session.get("activeTurnId")
+                if model is not None:
+                    session["model"] = model
+                if effort is not None:
+                    session["effort"] = effort
+                if approval_mode in ("auto_accept", "interactive"):
+                    session["approvalMode"] = approval_mode
+                self._save_state()
+            result = {"conversationId": conversation_id, "threadId": tid}
+            if tid and turn_id and (model is not None or effort is not None):
+                try:
+                    result["settingsUpdate"] = self.codex.turn_settings_update(tid, turn_id, model, effort)
+                except CodexRpcError:
+                    with self.lock:
+                        if session.get("activeTurnId") == turn_id:
+                            raise
+            if tid and compact:
+                self._ensure_thread(session)
+                result["compact"] = self.codex.thread_compact_start(tid)
+            return result
 
 
 # -----------------------------------------------------------------------------
@@ -1904,29 +2072,49 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
-
-    def do_OPTIONS(self) -> None:
-        self._send_json(200, {"ok": True})
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _read_json_body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length).decode("utf-8", errors="replace")
-        return json.loads(raw) if raw.strip() else {}
+        if not 0 < length <= 4 * 1024 * 1024:
+            raise ValueError("A JSON body of at most 4 MiB is required")
+        raw = self.rfile.read(length).decode("utf-8")
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("The JSON body must be an object")
+        return body
+
+    def local_host(self) -> bool:
+        return self.headers.get("Host", "").split(":", 1)[0] in ("127.0.0.1", "localhost")
 
     def do_GET(self) -> None:
         assert BRIDGE_INSTANCE is not None
+        if not self.local_host():
+            self._send_json(403, {"error": "The bridge accepts local requests"})
+            return
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
         try:
+            if parsed.path == "/api/ready":
+                self._send_json(200, {"status": "ok"})
+                return
+
+            if parsed.path == "/api/profiles":
+                self._send_json(200, BRIDGE_INSTANCE.list_profiles())
+                return
+
+            if parsed.path == "/api/subagent/sdk-status":
+                self._send_json(200, BRIDGE_INSTANCE.sdk_status(
+                    (qs.get("conversationId") or [""])[0], (qs.get("sdkInstanceId") or [""])[0],
+                ))
+                return
+
             if parsed.path == "/api/health":
                 try:
                     BRIDGE_INSTANCE.codex.connect()
@@ -1944,7 +2132,7 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            if parsed.path == "/api/subagents":
+            if parsed.path in ("/api/subagents", "/api/mission-control"):
                 root_conv = (qs.get("rootConversationId") or [""])[0] or None
                 inc_all = (qs.get("all") or ["true"])[0].lower() != "false"
                 data = BRIDGE_INSTANCE.list_unified_subagents(
@@ -1963,6 +2151,8 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_json(404, {"error": f"Unknown GET endpoint: {parsed.path}"})
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
         except Exception as e:
             logger.exception("Error in GET %s", self.path)
             self._send_json(500, {"error": str(e)})
@@ -1970,18 +2160,37 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         assert BRIDGE_INSTANCE is not None
         parsed = urllib.parse.urlparse(self.path)
+        if not self.local_host() or self.headers.get("Origin") or self.headers.get_content_type() != "application/json":
+            self._send_json(403, {"error": "Use a local client or the Mission Control sidecar"})
+            return
         try:
             body = self._read_json_body()
 
-            if body.get("lsAddress") or body.get("csrfToken"):
+            if body.get("lsAddress") or body.get("agentapiExe"):
                 BRIDGE_INSTANCE.update_ls_credentials(
-                    ls_address=body.get("lsAddress"),
-                    csrf_token=body.get("csrfToken"),
+                    ls_address=body.get("lsAddress"), csrf_token=body.get("csrfToken"),
                     agentapi_exe=body.get("agentapiExe"),
                 )
 
             if parsed.path == "/api/ls-credentials":
-                self._send_json(200, {"ok": True, "lsAddress": BRIDGE_INSTANCE.ls_address})
+                if body.get("sdkInstanceId"):
+                    registration = BRIDGE_INSTANCE.register_sdk(body)
+                    self._send_json(200, {"ok": True, **registration})
+                else:
+                    self._send_json(200, {"ok": True, "lsAddress": BRIDGE_INSTANCE.ls_address})
+                return
+
+            if parsed.path == "/api/subagent/sdk-unregister":
+                BRIDGE_INSTANCE.unregister_sdk(body["conversationId"], body["sdkInstanceId"])
+                self._send_json(200, {"ok": True})
+                return
+
+            if parsed.path == "/api/profiles/define":
+                self._send_json(200, BRIDGE_INSTANCE.define_profile(body))
+                return
+
+            if parsed.path == "/api/profiles/delete":
+                self._send_json(200, BRIDGE_INSTANCE.delete_profile(body["name"]))
                 return
 
             if parsed.path == "/api/dispatch":
@@ -1995,10 +2204,14 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                     role=body.get("role"),
                     model=body.get("model"),
                     effort=body.get("effort"),
-                    sandbox=body.get("sandbox", "workspace-write"),
-                    approval_policy=body.get("approvalPolicy", "never"),
+                    sandbox=body.get("sandboxMode") or body.get("sandbox"),
+                    approval_policy=body.get("approvalPolicy"),
                     ls_address=body.get("lsAddress"),
                     csrf_token=body.get("csrfToken"),
+                    agent_name=body.get("agentName"),
+                    execution_mode=body.get("executionMode"),
+                    sdk_instance=body.get("sdkInstanceId"),
+                    input_id=body.get("inputId"),
                 )
                 self._send_json(200, res)
                 return
@@ -2014,7 +2227,7 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/api/subagent/interrupt":
-                res = BRIDGE_INSTANCE.interrupt_subagent(body["conversationId"])
+                res = BRIDGE_INSTANCE.interrupt_subagent(body["conversationId"], body.get("sdkInstanceId"))
                 self._send_json(200, res)
                 return
 
@@ -2072,65 +2285,71 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_json(404, {"error": f"Unknown POST endpoint: {parsed.path}"})
+        except (ValueError, KeyError) as e:
+            self._send_json(400, {"error": str(e)})
         except Exception as e:
             logger.exception("Error in POST %s", self.path)
             self._send_json(500, {"error": str(e)})
 
 
 def ensure_bridge_daemon_running(port: int = BRIDGE_PORT) -> str:
-    """Client helper: checks if bridge HTTP daemon is running; spawns it if not."""
+    """Check HTTP readiness without waiting for the independent Codex connection."""
     base_url = f"http://{BRIDGE_HOST}:{port}"
-    try:
-        with urllib.request.urlopen(f"{base_url}/api/health", timeout=1.0) as resp:
-            if resp.status == 200:
-                return base_url
-    except Exception:
-        pass
+
+    def ready() -> bool:
+        try:
+            with urllib.request.urlopen(f"{base_url}/api/ready", timeout=0.5) as resp:
+                return resp.status == 200
+        except urllib.error.HTTPError as e:
+            e.close()
+            if e.code == 404:
+                try:
+                    with urllib.request.urlopen(f"{base_url}/api/health", timeout=0.5) as hresp:
+                        if hresp.status == 200:
+                            return True
+                except OSError:
+                    pass
+            return False
+        except OSError:
+            return False
+
+    if ready():
+        return base_url
 
     log_path = primary_app_data_dir() / "log" / "codex_bridge_daemon.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_path, "a", encoding="utf-8")
-    subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--port", str(port)],
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
-        env=os.environ.copy(),
-    )
+    with log_path.open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--port", str(port)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+    threading.Thread(target=process.wait, name="codex-bridge-reaper", daemon=True).start()
 
-    deadline = time.time() + 6.0
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(f"{base_url}/api/health", timeout=0.8) as resp:
-                if resp.status == 200:
-                    return base_url
-        except Exception:
-            time.sleep(0.15)
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        if ready():
+            return base_url
+        time.sleep(0.15)
     raise RuntimeError(f"Failed to start codex_bridge_daemon.py on {base_url}")
 
 
 def main() -> None:
     global BRIDGE_INSTANCE
     parser = argparse.ArgumentParser(description="Antigravity Codex & Unified Subagent Bridge Daemon")
-    parser.add_argument("--host", default=BRIDGE_HOST)
     parser.add_argument("--port", type=int, default=BRIDGE_PORT)
+    parser.add_argument("--host", choices=("127.0.0.1",), default=BRIDGE_HOST)
     args = parser.parse_args()
 
-    BRIDGE_INSTANCE = UnifiedSubagentBridge()
-    try:
-        BRIDGE_INSTANCE.codex.connect()
-    except Exception as e:
-        logger.warning("Initial connection to Codex daemon deferred: %s", e)
-
-    server = ThreadingHTTPServer((args.host, args.port), BridgeHttpHandler)
-    logger.info("Unified Subagent Bridge Daemon listening on http://%s:%d", args.host, args.port)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        BRIDGE_INSTANCE.codex.close()
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    with ThreadingHTTPServer((args.host, args.port), BridgeHttpHandler) as server:
+        BRIDGE_INSTANCE = UnifiedSubagentBridge()
+        logger.info("Unified Subagent Bridge Daemon listening on http://%s:%d", args.host, args.port)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            BRIDGE_INSTANCE.codex.close()
 
 
 if __name__ == "__main__":

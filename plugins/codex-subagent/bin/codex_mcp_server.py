@@ -97,6 +97,26 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "subagent_check_codex_quota",
+        "description": (
+            "Check remaining Codex account quota and rate-limit windows (`account/rateLimits/read`) "
+            "before launching a new Codex subagent. Returns `minRemainingPercent`, `thresholdPercent`, "
+            "`belowThreshold`, `windows`, and `summary`. If `belowThreshold` is true, DO NOT launch "
+            "Codex automatically — cancel and ask the user whether they want to continue anyway."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thresholdPercent": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Optional override for minimum remaining quota percentage (defaults to config minRemainingQuotaPercent, usually 10).",
+                },
+            },
+        },
+    },
+    {
         "name": "subagent_list_codex_sessions",
         "description": (
             "List existing Codex sessions/threads from the running `codex app-server` daemon "
@@ -412,6 +432,11 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Any:
         return bridge_post("/api/profiles/define", args)
     if name == "subagent_list_profiles":
         return bridge_get("/api/profiles")
+    if name == "subagent_check_codex_quota":
+        params = {}
+        if args.get("thresholdPercent") is not None:
+            params["threshold"] = str(args["thresholdPercent"])
+        return bridge_get("/api/codex/quota", params)
     if name == "subagent_list_codex_sessions":
         return bridge_get(
             "/api/codex/threads",

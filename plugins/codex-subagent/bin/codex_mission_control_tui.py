@@ -56,6 +56,7 @@ class MissionControlTUI:
         self.status_banner = "Ready — [s]Steer [q]Queue [i]Interrupt [t]TakeOver [P]Perms [F]Fork [r]Revert [p]Profiles"
         self.codex_connected = False
         self.codex_ua = ""
+        self.codex_quota: Dict[str, Any] = {}
         self.ls_addr = ""
         self.last_refresh = 0.0
 
@@ -71,6 +72,7 @@ class MissionControlTUI:
             mc = fetch_json(f"{self.base_url}/api/subagents{q}", timeout=1.5)
             self.codex_connected = bool(mc.get("codexDaemonConnected"))
             self.codex_ua = str(mc.get("codexUserAgent") or "")
+            self.codex_quota = mc.get("codexQuota") or {}
             self.ls_addr = str(mc.get("lsAddress") or "")
             self.subagents = mc.get("subagents") or []
 
@@ -309,9 +311,16 @@ class MissionControlTUI:
 
             # 1. Top Header Bar
             codex_badge = "CODEX:ONLINE" if self.codex_connected else "CODEX:OFFLINE"
+            quota_badge = ""
+            if self.codex_quota.get("available"):
+                rem = self.codex_quota.get("minRemainingPercent")
+                rem_txt = "∞" if self.codex_quota.get("unlimited") else (f"{rem:g}%" if rem is not None else "OK")
+                warn = " LOW!" if self.codex_quota.get("belowThreshold") else ""
+                quota_badge = f" │ QUOTA:{rem_txt}{warn}"
             scope_badge = "SCOPE:ALL" if self.show_all else "SCOPE:SESSION"
-            header = f" ◈ SUBAGENT MISSION CONTROL (TUI SPLIT) │ {codex_badge} │ {scope_badge} │ Filter:{self.engine_filter.upper()} "
-            self.safe_addstr(stdscr, 0, 0, header.ljust(max(0, w - 1)), curses.color_pair(4) | curses.A_REVERSE | curses.A_BOLD)
+            header = f" ◈ SUBAGENT MISSION CONTROL │ {codex_badge}{quota_badge} │ {scope_badge} │ {self.engine_filter.upper()} "
+            hdr_color = curses.color_pair(5) if self.codex_quota.get("belowThreshold") else curses.color_pair(4)
+            self.safe_addstr(stdscr, 0, 0, header.ljust(max(0, w - 1)), hdr_color | curses.A_REVERSE | curses.A_BOLD)
 
             # 2. Roster Section (Top pane of split)
             visible = self.filtered_subagents()

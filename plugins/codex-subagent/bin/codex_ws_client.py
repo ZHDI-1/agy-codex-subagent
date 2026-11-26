@@ -719,6 +719,10 @@ class CodexAppServerClient:
             params["effort"] = effort
         return self.request("turn/settings/update", params)
 
+    def account_rate_limits_read(self) -> Dict[str, Any]:
+        """Read current Codex account quota and rate limit windows from the daemon."""
+        return self.request("account/rateLimits/read", {}, timeout=10.0)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

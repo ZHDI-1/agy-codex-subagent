@@ -2,12 +2,16 @@
 
 You have access to the **`codex`** subagent (backed directly by the running `codex app-server` daemon over `~/.codex/app-server-control/app-server-control.sock`) and the **`codex-subagent-control`** MCP tool suite, which provides unified real-time inspection and mid-turn steering for **both** `codex` subagents and native Gemini subagents (`self`, `research`, etc.).
 
-## 1. Invoking Codex as a Native Subagent
+## 1. Invoking Codex as a Native Subagent & Pre-Launch Quota Guard
+
+**Before launching a new `codex` subagent**, check remaining Codex quota by calling `subagent_check_codex_quota` (from `codex-subagent-control`):
+- If `belowThreshold` is `true` (e.g. remaining quota < `minRemainingQuotaPercent`, default `10%`), **do NOT launch the Codex subagent yet**. Cancel the launch and **ask the user** (showing the remaining percentage, window, and reset time) whether they still want to continue.
+- If the user explicitly confirms they want to continue despite low quota, launch with `[FORCE] <your prompt>` (or if a subagent was already cancelled with `quota_blocked`, send `send_message(Recipient=<conversationId>, Message="[FORCE]")` to replay its queued prompt).
 
 Launch a Codex subagent using the standard `invoke_subagent` tool:
 - `TypeName`: `"codex"`
 - `Role`: Descriptive job title (e.g., `"Codex Kernel Refactorer"`, `"Codex Test Engineer"`)
-- `Prompt`: Clear task instructions
+- `Prompt`: Clear task instructions (prefix with `[FORCE] ` only after the user explicitly approves continuing under low quota)
 - `Workspace`: `"inherit"` (default), `"branch"`, or `"share"`
 
 `invoke_subagent` returns `{ conversationId }` immediately and runs asynchronously on the Codex App-Server Daemon. When the Codex turn completes, it automatically wakes you up with a structured report and unified diff summary.

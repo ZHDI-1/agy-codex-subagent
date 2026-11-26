@@ -281,6 +281,15 @@ async function pollAll() {
       badge.className = 'badge badge-dim';
     }
 
+    const qBadge = el('quota-badge');
+    const q = res.codexQuota;
+    if (qBadge && q && q.available) {
+      const rem = q.unlimited ? '∞' : (q.minRemainingPercent != null ? `${q.minRemainingPercent}% left` : 'OK');
+      qBadge.textContent = `Quota: ${rem}`;
+      qBadge.title = q.summary || '';
+      qBadge.className = q.belowThreshold ? 'badge badge-danger' : 'badge badge-ok';
+    }
+
     renderRoster();
     if (state.selectedId) {
       await pollInspect();
@@ -610,14 +619,33 @@ document.addEventListener('DOMContentLoaded', () => {
     const effort = el('spawn-effort').value;
     const prompt = el('spawn-prompt').value.trim();
     if (!prompt) return;
+
+    let bypassQuotaCheck = false;
+    try {
+      const quota = await apiGet('/api/codex/quota');
+      if (quota && quota.belowThreshold) {
+        const proceed = window.confirm(
+          `⚠️ Codex Quota Warning:\n${quota.summary}\n\nDo you still want to launch this Codex subagent?`
+        );
+        if (!proceed) {
+          showFeedback('Cancelled Codex launch due to low quota', true);
+          return;
+        }
+        bypassQuotaCheck = true;
+      }
+    } catch {}
+
     el('spawn-modal').classList.add('hidden');
     const res = await apiPost('/api/subagent/spawn-codex', {
       role,
       cwd,
       effort,
       prompt,
+      bypassQuotaCheck,
     });
-    if (res.conversationId) {
+    if (res.action === 'quota_blocked') {
+      showFeedback(`Cancelled: ${res.quota?.summary || 'Codex quota below threshold'}`, true);
+    } else if (res.conversationId) {
       state.selectedId = res.conversationId;
       showFeedback(`Spawned Codex thread ${res.threadId || ''}`);
     }

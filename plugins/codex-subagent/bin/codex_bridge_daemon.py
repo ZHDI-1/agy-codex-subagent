@@ -74,7 +74,7 @@ SYSTEM_MSG_TAG_RE = re.compile(
     re.DOTALL,
 )
 PREFIX_CMD_RE = re.compile(
-    r"^\s*\[(STEER|QUEUE|INTERRUPT|REVERT(?::\d+)?|COMPACT|APPROVE|DECLINE|MODEL:[^\]]+|EFFORT:[^\]]+|ADOPT:[^\]]+|PERMISSION:[^\]]+)\]\s*(.*)$",
+    r"^\s*\[(STEER|QUEUE|INTERRUPT|FORCE|REVERT(?::\d+)?|COMPACT|APPROVE|DECLINE|MODEL:[^\]]+|EFFORT:[^\]]+|ADOPT:[^\]]+|PERMISSION:[^\]]+)\]\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -715,6 +715,7 @@ class UnifiedSubagentBridge:
         sdk_instance: Optional[str] = None,
         input_id: Optional[str] = None,
         additional_context: Optional[str] = None,
+        bypass_quota_check: bool = False,
     ) -> Dict[str, Any]:
         clean_text = user_input.strip()
         extracted_parent = parent_conversation_id or ""
@@ -792,6 +793,16 @@ class UnifiedSubagentBridge:
 
             try:
                 directive = PREFIX_CMD_RE.match(clean_text)
+                if directive and directive[1].upper() == "FORCE":
+                    bypass_quota_check = True
+                    forced_body = directive[2].strip()
+                    with self.lock:
+                        pending_prompt = session.pop("pendingQuotaPrompt", "")
+                    clean_text = forced_body or pending_prompt
+                    if not clean_text:
+                        return {"action": "no_input", "conversationId": conversation_id}
+                    directive = PREFIX_CMD_RE.match(clean_text)
+
                 if directive and directive[1].upper().startswith("ADOPT:"):
                     raw_target_tid = directive[1].split(":", 1)[1].strip()
                     result = self.adopt_codex_thread(
@@ -802,6 +813,12 @@ class UnifiedSubagentBridge:
                         prompt=directive[2].strip() or None,
                     )
                 else:
+                    is_new_thread = not bool(session.get("threadId"))
+                    if is_new_thread and not bypass_quota_check and not directive:
+                        quota = self.get_codex_quota()
+                        if quota.get("belowThreshold"):
+                            result = self._handle_quota_blocked(session, clean_text, quota)
+                            return result
                     self._ensure_thread(session)
                     if directive:
                         result = self._execute_directive(session, directive[1].upper(), directive[2].strip())
@@ -1743,6 +1760,7 @@ class UnifiedSubagentBridge:
             "codexDaemonConnected": self.codex.is_connected(),
             "codexUserAgent": self.codex.user_agent,
             "lsAddress": self.ls_address,
+            "codexQuota": self.get_codex_quota(use_cache=True),
             "subagents": subagents,
         }
 
@@ -2060,6 +2078,228 @@ class UnifiedSubagentBridge:
                 "targetConversationId": target_id,
                 "result": send_res,
             }
+
+    def _resolve_quota_threshold(self, threshold_percent: Optional[int] = None) -> int:
+        if threshold_percent is not None:
+            return max(0, min(100, int(threshold_percent)))
+        env_raw = os.environ.get("AGY_CODEX_MIN_QUOTA_PERCENT")
+        if env_raw is not None and env_raw.strip() != "":
+            try:
+                return max(0, min(100, int(env_raw.strip())))
+            except ValueError:
+                pass
+        try:
+            cfg = load_config()
+            return max(0, min(100, int(cfg.get("minRemainingQuotaPercent", 10))))
+        except Exception:
+            return 10
+
+    @staticmethod
+    def _format_window_label(mins: Any) -> str:
+        if not isinstance(mins, (int, float)) or mins <= 0:
+            return "window"
+        mins_i = int(mins)
+        if mins_i % 1440 == 0:
+            return f"{mins_i // 1440}d"
+        if mins_i % 60 == 0:
+            return f"{mins_i // 60}h"
+        return f"{mins_i}m"
+
+    def get_codex_quota(
+        self,
+        threshold_percent: Optional[int] = None,
+        use_cache: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Queries `account/rateLimits/read` on the Codex App-Server Daemon and evaluates
+        whether remaining quota is below `minRemainingQuotaPercent`.
+        """
+        threshold = self._resolve_quota_threshold(threshold_percent)
+        now = time.monotonic()
+        cached = getattr(self, "_quota_cache", None)
+        if use_cache and cached and (now - cached[0] < 15.0) and cached[1].get("thresholdPercent") == threshold:
+            return dict(cached[1])
+
+        try:
+            raw = self.codex.account_rate_limits_read()
+        except Exception as e:
+            logger.debug("account/rateLimits/read failed: %s", e)
+            return {
+                "available": False,
+                "belowThreshold": False,
+                "thresholdPercent": threshold,
+                "error": str(e),
+                "summary": f"Codex quota check unavailable: {e}",
+            }
+
+        if not isinstance(raw, dict) or not raw.get("rateLimits"):
+            return {
+                "available": False,
+                "belowThreshold": False,
+                "thresholdPercent": threshold,
+                "summary": "Codex quota telemetry not reported by daemon.",
+            }
+
+        rl = raw.get("rateLimits") or {}
+        credits = rl.get("credits") or {}
+        unlimited = bool(credits.get("unlimited"))
+        ordinary_allowed = raw.get("ordinaryUsageAllowed")
+        spend_reached = bool(rl.get("spendControlReached"))
+        reached_type = rl.get("rateLimitReachedType")
+        plan_type = rl.get("planType") or ""
+        reset_credits = (raw.get("rateLimitResetCredits") or {}).get("availableCount", 0)
+
+        windows: List[Dict[str, Any]] = []
+        remaining_values: List[float] = []
+        for wname in ("primary", "secondary"):
+            w = rl.get(wname)
+            if not isinstance(w, dict):
+                continue
+            used = float(w.get("usedPercent", 0) or 0)
+            rem = max(0.0, round(100.0 - used, 2))
+            resets_at = w.get("resetsAt")
+            resets_iso = ""
+            if isinstance(resets_at, (int, float)) and resets_at > 0:
+                resets_iso = datetime.datetime.fromtimestamp(
+                    resets_at, tz=datetime.timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC")
+            dur = w.get("windowDurationMins")
+            windows.append({
+                "name": wname,
+                "usedPercent": used,
+                "remainingPercent": rem,
+                "windowDurationMins": dur,
+                "windowLabel": self._format_window_label(dur),
+                "resetsAt": resets_at,
+                "resetsAtIso": resets_iso,
+            })
+            remaining_values.append(rem)
+
+        min_remaining: Optional[float] = min(remaining_values) if remaining_values else None
+        below_threshold = False
+        reasons: List[str] = []
+        if threshold > 0 and not unlimited:
+            if ordinary_allowed is False:
+                below_threshold = True
+                reasons.append("ordinaryUsageAllowed=false")
+            if spend_reached:
+                below_threshold = True
+                reasons.append("spendControlReached=true")
+            if reached_type:
+                below_threshold = True
+                reasons.append(f"rateLimitReachedType={reached_type}")
+            if min_remaining is not None and min_remaining < threshold:
+                below_threshold = True
+                reasons.append(f"remaining {min_remaining:g}% < threshold {threshold}%")
+
+        win_parts = [
+            f"{w['name']}({w['windowLabel']}): {w['remainingPercent']:g}% left ({w['usedPercent']:g}% used"
+            + (f", resets {w['resetsAtIso']}" if w.get("resetsAtIso") else "")
+            + ")"
+            for w in windows
+        ]
+        summary_body = "; ".join(win_parts) if win_parts else "no active limit windows"
+        if below_threshold:
+            summary = f"Codex quota LOW ({', '.join(reasons)}) — {summary_body}"
+        elif unlimited:
+            summary = f"Codex quota unlimited ({plan_type or 'plan'})"
+        else:
+            summary = f"Codex quota OK (threshold {threshold}%) — {summary_body}"
+
+        result = {
+            "available": True,
+            "planType": plan_type,
+            "ordinaryUsageAllowed": ordinary_allowed,
+            "spendControlReached": spend_reached,
+            "rateLimitReachedType": reached_type,
+            "unlimited": unlimited,
+            "hasCredits": bool(credits.get("hasCredits")),
+            "creditsBalance": str(credits.get("balance") or "0"),
+            "resetCreditsAvailable": int(reset_credits or 0),
+            "thresholdPercent": threshold,
+            "minRemainingPercent": min_remaining,
+            "belowThreshold": below_threshold,
+            "reasons": reasons,
+            "windows": windows,
+            "summary": summary,
+        }
+        self._quota_cache = (now, result)
+        return dict(result)
+
+    def _handle_quota_blocked(
+        self,
+        session: Dict[str, Any],
+        prompt_text: str,
+        quota: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Cancels launching a new Codex thread when quota is below threshold and notifies the parent."""
+        conv_id = session["conversationId"]
+        role = session.get("role") or "Codex Subagent"
+        parent = session.get("parentConversationId", "")
+        credentials = self._session_credentials(session)
+
+        msg_lines = [
+            f"### ⚠️ Codex Launch Cancelled — Quota Below Threshold ({quota.get('thresholdPercent')}%)",
+            f"- **Subagent Conversation**: [{role}](conversation://{conv_id})",
+            f"- **Quota Status**: {quota.get('summary')}",
+        ]
+        if quota.get("resetCreditsAvailable"):
+            msg_lines.append(
+                f"- **Reset Credits Available**: {quota['resetCreditsAvailable']} free rate-limit reset credit(s) on account."
+            )
+        msg_lines.extend([
+            "",
+            "**Action Required**: Ask the user if they still want to continue launching Codex despite the low remaining quota.",
+            f"- If the user confirms **Yes**, send `[FORCE]` to `{conv_id}` (`send_message(Recipient=\"{conv_id}\", Message=\"[FORCE]\")`) to replay the queued task immediately without creating a new conversation.",
+            "- If the user confirms **No**, keep this subagent cancelled and handle the task with another agent or wait for reset.",
+        ])
+        report_text = "\n".join(msg_lines)
+
+        with self.lock:
+            session.update(
+                status="quota_blocked",
+                currentActivity=quota.get("summary", "Quota below threshold"),
+                activityKind="warning",
+                pendingQuotaPrompt=prompt_text,
+                quotaCheck=quota,
+                updatedAt=utc_now_iso(),
+            )
+            self._append_transcript_step(session, {
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": session.get("model") or "codex",
+                "response": report_text,
+                "tool_calls": [],
+            })
+            self._record_event(session, "quota/blocked", {
+                "minRemainingPercent": quota.get("minRemainingPercent"),
+                "thresholdPercent": quota.get("thresholdPercent"),
+            })
+            self._sync_sqlite_status(conv_id, "CASCADE_RUN_STATUS_IDLE", session["stepCount"], quota.get("summary", ""), 0)
+            self._save_state()
+
+        if parent:
+            threading.Thread(
+                target=self.send_message_to_agy_conversation,
+                kwargs={
+                    "recipient_id": parent,
+                    "sender_id": conv_id,
+                    "title": f"Codex Launch Cancelled: Low Quota ({quota.get('minRemainingPercent')}% left)",
+                    "content": report_text,
+                    **credentials,
+                },
+                name="codex-quota-blocked-notify",
+                daemon=True,
+            ).start()
+
+        return {
+            "action": "quota_blocked",
+            "conversationId": conv_id,
+            "status": "quota_blocked",
+            "quota": quota,
+            "message": report_text,
+        }
 
     def list_codex_threads(
         self,
@@ -2635,6 +2875,12 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 self._send_json(200, BRIDGE_INSTANCE.list_codex_threads(limit=limit, search_term=search, cwd=cwd))
                 return
 
+            if parsed.path == "/api/codex/quota":
+                raw_thr = (qs.get("threshold") or [None])[0]
+                thr = int(raw_thr) if raw_thr is not None and raw_thr != "" else None
+                self._send_json(200, BRIDGE_INSTANCE.get_codex_quota(threshold_percent=thr, use_cache=False))
+                return
+
             self._send_json(404, {"error": f"Unknown GET endpoint: {parsed.path}"})
         except ValueError as e:
             self._send_json(400, {"error": str(e)})
@@ -2697,6 +2943,7 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                     execution_mode=body.get("executionMode"),
                     sdk_instance=body.get("sdkInstanceId"),
                     input_id=body.get("inputId"),
+                    bypass_quota_check=bool(body.get("bypassQuotaCheck", False)),
                 )
                 self._send_json(200, res)
                 return

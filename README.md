@@ -250,6 +250,7 @@ cd agy-codex-subagent
 | `subagent_fork` | **Codex + Gemini** | Forks a Codex thread via `thread/fork` (optionally at `beforeTurnId`) or forks Gemini context into a new Codex thread |
 | `subagent_configure` | **Codex** | Live updates `model`, `effort`, `permissionSource` (`codexConfig` / `bypass` / `custom`), `approvalPolicy`, `sandboxMode`, or triggers `compact` |
 | `subagent_handoff` | **Codex ⇄ Gemini** | Transfers latest thinking, findings, and workspace directory from `research`/`self` to `codex` (or vice versa) |
+| `subagent_check_codex_quota` | **Codex** | Checks live remaining Codex quota/rate limits (`account/rateLimits/read`) before launching; blocks & asks user if below `minRemainingQuotaPercent` |
 | `subagent_list_codex_sessions` | **Codex** | Lists loaded in-memory threads (`thread/loaded/list`) and persisted sessions (`thread/list`) from `codex app-server` |
 | `subagent_adopt_codex_session` | **Codex** | Directly takes over an existing Codex `threadId`, imports its historical turns into `transcript.jsonl`, and applies permissions |
 | `subagent_define_profile` | **Codex** | Creates or updates a specialized Codex subagent profile and registers its native Antigravity subagent definition |
@@ -272,6 +273,7 @@ When messaging a Codex subagent via `send_message(Recipient=<conversationId>, Me
 | `[MODEL:<model>]` | `turn/settings/update` & `thread/settings/update` | Dynamically switches the Codex model |
 | `[PERMISSION:bypass\|codexConfig\|<ap>:<sb>]` | `thread/settings/update` | Dynamically switches permissions (`bypass`, `~/.codex/config.toml`, or custom `never:danger-full-access`) |
 | `[ADOPT:<threadId>] <optional prompt>` | `thread/resume` + `thread/turns/list` | Takes over an existing standalone Codex session and hydrates its history |
+| `[FORCE]` / `[FORCE] <prompt>` | `thread/start` + `turn/start` | Overrides the pre-launch quota guard after user confirmation (empty `[FORCE]` replays the previously blocked prompt) |
 | `[COMPACT]` | `thread/compact/start` | Triggers context window compaction on the Codex thread |
 
 ---

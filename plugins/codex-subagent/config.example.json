@@ -4,5 +4,6 @@
   "model": "gpt-6.2-sol",
   "effort": "xhigh",
   "approvalPolicy": "never",
-  "sandboxMode": "danger-full-access"
+  "sandboxMode": "danger-full-access",
+  "minRemainingQuotaPercent": 10
 }

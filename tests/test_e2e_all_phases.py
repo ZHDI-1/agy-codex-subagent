@@ -214,7 +214,7 @@ class TestExecutorAndProfiles(unittest.TestCase):
     def test_profile_provider_routes_and_persists(self):
         profile = {"name": "codex-reviewer", "description": "Review: change",
                    "model": "o3", "effort": "ultra", "systemPrompt": "Review the patch.",
-                   "permissionSource": "custom",
+                   "permissionSource": "custom", "minRemainingQuotaPercent": 10,
                    "sandboxMode": "read-only", "approvalPolicy": "on-request", "executionMode": "sdkExecutor"}
         replies = {
             "/api/profiles/define": self.bridge.define_profile, "/api/profiles": self.bridge.list_profiles,
@@ -290,6 +290,52 @@ class TestExecutorAndProfiles(unittest.TestCase):
             self.assertEqual(inline_adopt["action"], "thread/adopt")
             self.assertEqual(inline_adopt["threadId"], "thread-existing-1")
             self.assertEqual(inline_adopt["dispatch"]["action"], "turn/start")
+
+    def test_quota_guard_blocks_and_force_replays(self):
+        low_quota_payload = {
+            "ordinaryUsageAllowed": True,
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 96, "windowDurationMins": 10080, "resetsAt": 1795703227},
+                "secondary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 1795700000},
+                "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+                "spendControlReached": False,
+                "planType": "pro",
+                "rateLimitReachedType": None,
+            },
+            "rateLimitResetCredits": {"availableCount": 1},
+        }
+        orig_request = self.codex.request
+
+        def quota_request(method, params=None, timeout=60):
+            if method == "account/rateLimits/read":
+                return low_quota_payload
+            return orig_request(method, params, timeout)
+
+        with patch.object(self.codex, "request", side_effect=quota_request), \
+             patch.object(self.bridge, "send_message_to_agy_conversation") as notify_parent:
+            q = self.bridge.get_codex_quota(threshold_percent=10)
+            self.assertTrue(q["available"])
+            self.assertEqual(q["minRemainingPercent"], 4.0)
+            self.assertTrue(q["belowThreshold"])
+            self.assertEqual(q["resetCreditsAvailable"], 1)
+
+            blocked = self.bridge.dispatch_subagent_input(
+                "quota-conv-1", "Refactor lockless queue", parent_conversation_id="parent-123"
+            )
+            self.assertEqual(blocked["action"], "quota_blocked")
+            self.assertEqual(blocked["status"], "quota_blocked")
+            self.assertEqual(sum(m == "thread/start" for m, _ in self.codex.calls), 0)
+            wait_until(lambda: notify_parent.called, timeout=2)
+            self.assertIn("Low Quota", notify_parent.call_args.kwargs["title"])
+            self.assertIn("[FORCE]", notify_parent.call_args.kwargs["content"])
+
+            # User confirms -> send [FORCE] to replay pendingQuotaPrompt without re-typing!
+            forced = self.bridge.dispatch_subagent_input("quota-conv-1", "[FORCE]")
+            self.assertEqual(forced["action"], "turn/start")
+            self.assertEqual(sum(m == "thread/start" for m, _ in self.codex.calls), 1)
+            turn_call = next(p for m, p in self.codex.calls if m == "turn/start")
+            self.assertIn("Refactor lockless queue", turn_call["input"][0]["text"])
 
     def test_serialized_dispatch_steers_and_cleans_approvals(self):
         conv = "concurrent"
@@ -568,6 +614,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             "AGY_CODEX_PROFILE_DIR": str(cls.temp_dir / "profiles"),
             "AGY_CODEX_WORKSPACE_ROOT": str(cls.temp_dir),
             "AGY_CODEX_GLOBAL_AGENTS": str(cls.temp_dir / "global-agents"),
+            "AGY_CODEX_MIN_QUOTA_PERCENT": "0",
             "ANTIGRAVITY_LS_ADDRESS": "", "ANTIGRAVITY_CSRF_TOKEN": "",
         }
         with sqlite3.connect(cls.temp_dir / "conversation_summaries.db") as db:
@@ -845,6 +892,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "subagent_handoff",
                 "subagent_define_profile",
                 "subagent_list_profiles",
+                "subagent_check_codex_quota",
                 "subagent_list_codex_sessions",
                 "subagent_adopt_codex_session",
             }
@@ -853,7 +901,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             profile = {
                 "name": "codex-e2e-reviewer", "description": "Reviews tests", "model": "gpt-6.2-sol",
                 "effort": "medium", "systemPrompt": "You are the e2e reviewer.", "executionMode": "sdkExecutor",
-                "permissionSource": "custom",
+                "permissionSource": "custom", "minRemainingQuotaPercent": 10,
                 "sandboxMode": "read-only", "approvalPolicy": "on-request",
             }
             definition = rpc(8, "tools/call", {"name": "subagent_define_profile", "arguments": profile})["result"]
@@ -935,10 +983,16 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             self.assertFalse(cfg_resp["result"]["isError"], cfg_resp)
             cfg_data = json.loads(cfg_resp["result"]["content"][0]["text"])
             self.assertEqual(cfg_data["permissionSource"], "codexConfig")
+            # Test live subagent_check_codex_quota MCP tool against codex app-server
+            quota_resp = rpc(13, "tools/call", {"name": "subagent_check_codex_quota", "arguments": {"thresholdPercent": 10}})
+            self.assertFalse(quota_resp["result"]["isError"], quota_resp)
+            quota_data = json.loads(quota_resp["result"]["content"][0]["text"])
+            self.assertIn("available", quota_data)
+            self.assertIn("belowThreshold", quota_data)
             print(
                 f"  [Phase 2 MCP] Verified subagent_adopt_codex_session (thread={target_tid}, "
-                f"hydratedTurns={adopt_data.get('hydratedTurns')}) and permissionSource={cfg_data['permissionSource']} "
-                f"({cfg_data['approvalPolicy']}/{cfg_data['sandboxMode']})"
+                f"hydratedTurns={adopt_data.get('hydratedTurns')}), permissionSource={cfg_data['permissionSource']}, "
+                f"and live quota check: {quota_data.get('summary')}"
             )
         finally:
             for stream in (proc.stdin, proc.stdout, proc.stderr):

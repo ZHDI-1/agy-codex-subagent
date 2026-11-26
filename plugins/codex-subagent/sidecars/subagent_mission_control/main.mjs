@@ -257,6 +257,7 @@ app.api('/api/subagent/spawn-codex', async (data) => {
     model: data.model || undefined,
     effort: data.effort || undefined,
     userInput: data.prompt || '',
+    bypassQuotaCheck: Boolean(data.bypassQuotaCheck),
   });
 }, 'POST');
 
@@ -264,6 +265,7 @@ app.api('/api/profiles', () => bridgeGet('/api/profiles'), 'GET');
 app.api('/api/profiles/define', (data) => bridgePost('/api/profiles/define', data), 'POST');
 app.api('/api/profiles/delete', (data) => bridgePost('/api/profiles/delete', data), 'POST');
 app.api('/api/codex/threads', (data) => bridgeGet('/api/codex/threads', data), 'GET');
+app.api('/api/codex/quota', (data) => bridgeGet('/api/codex/quota', data), 'GET');
 app.api('/api/codex/adopt', (data) => bridgePost('/api/codex/adopt', {
   parentConversationId: data.parentConversationId || app.config.conversationId || '',
   ...data,

@@ -137,6 +137,11 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
         value = settings.get(field, "")
         if not isinstance(value, str) or (field == "model" and not value.strip()):
             raise ValueError(f"{field} must be a valid string")
+    if "minRemainingQuotaPercent" in settings and settings["minRemainingQuotaPercent"] is not None:
+        raw_q = settings["minRemainingQuotaPercent"]
+        if isinstance(raw_q, bool) or not isinstance(raw_q, (int, float)) or not (0 <= int(raw_q) <= 100):
+            raise ValueError("minRemainingQuotaPercent must be an integer between 0 and 100")
+        settings["minRemainingQuotaPercent"] = int(raw_q)
     return settings
 
 

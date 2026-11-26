@@ -220,11 +220,11 @@ def main() -> None:
         return
 
     cwd = payload.get("cwd") or next(iter(payload.get("workspacePaths") or []), os.getcwd())
-    profile = saved.get("profiles", {}).get(name) or load_profiles().get(name) or load_config()
-    if live_sdk_instance(session) or (
-        profile["executionMode"] == "sdkExecutor" and active_sdk_definition(name, cwd)
-    ):
-        # Pass through before reading FileStore markers or calling CancelCascadeInvocation.
+    if live_sdk_instance(session):
+        # Only pass through when a live sdkExecutor process is actually registered for THIS conversation.
+        # Never pass through solely because a .json file exists on disk: if Antigravity loaded a .md
+        # fallback (e.g., plugin agents/codex.md in another workspace) and fired PreInvocation, we MUST
+        # intercept here so Gemini flash_lite never runs unintercepted!
         print("{}")
         return
 

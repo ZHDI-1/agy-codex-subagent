@@ -510,13 +510,20 @@ class TestExecutorAndProfiles(unittest.TestCase):
         env = {
             **os.environ, "AGY_CODEX_PROFILE_DIR": str(self.root / "profiles"), "AGY_CODEX_WORKSPACE_ROOT": str(self.root),
             "AGY_CODEX_GLOBAL_AGENTS": str(self.root / "global-agents"),
+            "AGY_CODEX_APP_DATA_DIR": str(self.root),
         }
+        # 1. When a live sdkExecutor process IS registered for this conversation, PreInvocation passes through.
+        self.bridge.register_sdk({
+            "conversationId": "hook-conv", "agentName": "codex-audit",
+            "sdkInstanceId": "live-inst", "sdkPid": os.getpid(),
+        })
         proc = subprocess.run([sys.executable, str(script)], env=env, input=json.dumps(payload),
                               text=True, capture_output=True, timeout=5)
         self.assertEqual(json.loads(proc.stdout), {})
-        # Changing the effective definition leaves the configured SDK mode intact.
-        (self.root / ".agents/agents/codex-audit.json").unlink()
-        (self.root / ".agents/agents/codex-audit.md").write_text("fallback")
+
+        # 2. When NO live sdkExecutor is registered (e.g. plugin codex.md shadowed codex.json in another
+        # workspace), PreInvocation MUST intercept instead of letting Gemini flash_lite run!
+        self.bridge.unregister_sdk("hook-conv", "live-inst")
         with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
              patch.object(sys, "stdout", io.StringIO()) as output, \
              patch.object(hook_module, "ensure_bridge_daemon_running", return_value="http://bridge"), \

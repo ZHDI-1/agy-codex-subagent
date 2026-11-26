@@ -16,8 +16,7 @@ Launch a Codex subagent using the standard `invoke_subagent` tool:
 
 `invoke_subagent` returns `{ conversationId }` immediately and runs asynchronously on the Codex App-Server Daemon. When the Codex turn completes, it automatically wakes you up with a structured report and unified diff summary.
 
-Define specialized types with `subagent_define_profile` and discover them with
-`subagent_list_profiles`. Use the profile's name as `TypeName` when invoking it.
+Define specialized types with `subagent_define_profile` (supports BOTH `backend: "codex"` for OpenAI Codex and `backend: "agy"` for Antigravity ACP with exact model selection such as `claude-opus-5-5-high`, `claude-sonnet-5-5-high`, `gemini-4-neon-xhigh`, `gemini-4-argon-high`, `gpt-oss-120b-medium`) and discover them with `subagent_list_profiles` / `subagent_list_agy_models`. Use the profile's name as `TypeName` when invoking it.
 
 ## 2. Mid-Turn Steering & Session Intervention
 

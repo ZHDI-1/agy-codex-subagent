@@ -23,6 +23,7 @@ GLOBAL_CONFIG = Path(os.environ.get("AGY_CODEX_GLOBAL_CONFIG", Path.home() / ".g
 GLOBAL_AGENTS = Path(os.environ.get("AGY_CODEX_GLOBAL_AGENTS", GLOBAL_CONFIG / "agents"))
 CODEX_CONFIG_TOML = Path(os.environ.get("CODEX_CONFIG_TOML", Path.home() / ".codex/config.toml"))
 EXECUTION_MODES = ("preInvocation", "sdkExecutor")
+BACKENDS = ("codex", "agy")
 PERMISSION_SOURCES = ("codexConfig", "bypass", "custom")
 EFFORTS = ("low", "medium", "high", "xhigh", "ultra")
 SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access", "inherit")
@@ -119,12 +120,15 @@ def load_config() -> dict[str, Any]:
 
 
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    if "backend" not in settings or not settings.get("backend"):
+        settings["backend"] = "codex"
     if "permissionSource" not in settings or not settings.get("permissionSource"):
         if settings.get("approvalPolicy") == "inherit" or settings.get("sandboxMode") == "inherit":
             settings["permissionSource"] = "codexConfig"
         else:
             settings["permissionSource"] = "custom"
     for field, options in (
+        ("backend", BACKENDS),
         ("executionMode", EXECUTION_MODES),
         ("permissionSource", PERMISSION_SOURCES),
         ("effort", EFFORTS),
@@ -155,12 +159,14 @@ def validate_name(name: Any) -> str:
 
 def normalize_profile(data: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
     name = validate_name(data.get("name"))
-    defaults = {"description": f"Codex subagent profile {name}", "systemPrompt": "", **load_config()}
+    defaults = {"description": f"Subagent profile {name}", "systemPrompt": "", "backend": "codex", **load_config()}
     for field in defaults:
         if previous and field in previous:
             defaults[field] = previous[field]
         if field in data:
             defaults[field] = data[field]
+    if defaults.get("backend") == "agy" and "model" not in data and (not previous or previous.get("backend") != "agy"):
+        defaults["model"] = "gemini-4-neon-high"
     if "permissionSource" not in data and (
         (data.get("sandboxMode") not in (None, "", "inherit"))
         or (data.get("approvalPolicy") not in (None, "", "inherit"))

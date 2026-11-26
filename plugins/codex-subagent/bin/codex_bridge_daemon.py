@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from agy_acp_client import AgyAcpClient, AgyAcpRpcError
 from codex_profiles import (
     PROFILE_DIR, apply_files, definition_changes, live_sdk_instance, load_config, load_profiles, normalize_profile,
     read_codex_config_toml, resolve_effective_permissions, validate_name, validate_settings, write_object,
@@ -328,6 +329,11 @@ class UnifiedSubagentBridge:
         self.codex.add_notification_handler(self._on_codex_notification)
         self.codex.set_server_request_handler(self._on_codex_server_request)
 
+        self.agy = AgyAcpClient()
+        self.agy.add_notification_handler(self._on_agy_notification)
+        self._agy_connections: Dict[str, Any] = {}
+        self._agy_queued_prompts: Dict[str, List[str]] = {}
+
     # -------------------------------------------------------------------------
     # Persistence & Credentials
     # -------------------------------------------------------------------------
@@ -419,12 +425,14 @@ class UnifiedSubagentBridge:
         with self.lock:
             return self._conversation_locks.setdefault(conversation_id, threading.RLock())
 
-    def _new_session(self, conversation_id: str, agent_name: str) -> Dict[str, Any]:
+    def _new_session(self, conversation_id: str, agent_name: str, backend_override: Optional[str] = None) -> Dict[str, Any]:
         settings = load_config()
         if agent_name != "codex":
-            if agent_name not in self.profiles:
+            if agent_name in self.profiles:
+                settings.update(self.profiles[agent_name])
+            elif backend_override != "agy":
                 raise ValueError(f"Unknown Codex profile {agent_name!r}")
-            settings.update(self.profiles[agent_name])
+        backend = backend_override or settings.get("backend", "codex")
         perm_src, eff_ap, eff_sb = resolve_effective_permissions(
             settings.get("permissionSource"),
             settings.get("approvalPolicy"),
@@ -432,9 +440,14 @@ class UnifiedSubagentBridge:
         )
         return {
             "conversationId": conversation_id, "parentConversationId": "", "agentName": agent_name,
-            "engine": "codex", "role": "Codex Subagent", "cwd": "", "transcriptPath": "",
+            "backend": backend, "engine": "agy" if backend == "agy" else "codex",
+            "role": "AGY Subagent" if backend == "agy" else "Codex Subagent",
+            "cwd": "", "transcriptPath": "",
             "threadId": None, "activeTurnId": None, "status": "idle", "executionMode": "preInvocation",
-            "model": settings["model"], "effort": settings["effort"],
+            "model": settings["model"] if backend != "agy" else (
+                settings["model"] if settings.get("backend") == "agy" else "gemini-4-neon-high"
+            ),
+            "effort": settings["effort"],
             "permissionSource": perm_src, "sandbox": eff_sb, "approvalPolicy": eff_ap,
             "approvalMode": "interactive",
             "systemPrompt": settings.get("systemPrompt", ""),
@@ -716,6 +729,7 @@ class UnifiedSubagentBridge:
         input_id: Optional[str] = None,
         additional_context: Optional[str] = None,
         bypass_quota_check: bool = False,
+        backend: Optional[str] = None,
     ) -> Dict[str, Any]:
         clean_text = user_input.strip()
         extracted_parent = parent_conversation_id or ""
@@ -751,8 +765,11 @@ class UnifiedSubagentBridge:
                 if session and execution_mode == "preInvocation" and live_sdk_instance(session):
                     return {"action": "sdkExecutor", "conversationId": conversation_id}
                 if session is None:
-                    session = self._new_session(conversation_id, agent_name or "codex")
+                    session = self._new_session(conversation_id, agent_name or "codex", backend_override=backend)
                     self.sessions_by_conv[conversation_id] = session
+                elif backend and not session.get("threadId"):
+                    session["backend"] = backend
+                    session["engine"] = "agy" if backend == "agy" else "codex"
                 if agent_name and session.get("agentName", "codex") != agent_name:
                     raise ValueError("The conversation is already bound to a different profile")
                 if execution_mode == "preInvocation":
@@ -786,44 +803,47 @@ class UnifiedSubagentBridge:
                         if (app_data / "brain" / conversation_id).is_dir():
                             session["appDataDir"] = str(app_data)
                             break
-                if role and session.get("role") in ("", None, "Codex Subagent"):
+                if role and session.get("role") in ("", None, "Codex Subagent", "AGY Subagent"):
                     session["role"] = role
                 if ls_address:
                     session.update(lsAddress=ls_address, csrfToken=csrf_token or "")
 
             try:
-                directive = PREFIX_CMD_RE.match(clean_text)
-                if directive and directive[1].upper() == "FORCE":
-                    bypass_quota_check = True
-                    forced_body = directive[2].strip()
-                    with self.lock:
-                        pending_prompt = session.pop("pendingQuotaPrompt", "")
-                    clean_text = forced_body or pending_prompt
-                    if not clean_text:
-                        return {"action": "no_input", "conversationId": conversation_id}
-                    directive = PREFIX_CMD_RE.match(clean_text)
-
-                if directive and directive[1].upper().startswith("ADOPT:"):
-                    raw_target_tid = directive[1].split(":", 1)[1].strip()
-                    result = self.adopt_codex_thread(
-                        thread_id=raw_target_tid,
-                        conversation_id=conversation_id,
-                        parent_conversation_id=session.get("parentConversationId") or extracted_parent,
-                        role=role or session.get("role"),
-                        prompt=directive[2].strip() or None,
-                    )
+                if session.get("backend") == "agy":
+                    result = self._dispatch_agy_input(session, clean_text, additional_context)
                 else:
-                    is_new_thread = not bool(session.get("threadId"))
-                    if is_new_thread and not bypass_quota_check and not directive:
-                        quota = self.get_codex_quota()
-                        if quota.get("belowThreshold"):
-                            result = self._handle_quota_blocked(session, clean_text, quota)
-                            return result
-                    self._ensure_thread(session)
-                    if directive:
-                        result = self._execute_directive(session, directive[1].upper(), directive[2].strip())
+                    directive = PREFIX_CMD_RE.match(clean_text)
+                    if directive and directive[1].upper() == "FORCE":
+                        bypass_quota_check = True
+                        forced_body = directive[2].strip()
+                        with self.lock:
+                            pending_prompt = session.pop("pendingQuotaPrompt", "")
+                        clean_text = forced_body or pending_prompt
+                        if not clean_text:
+                            return {"action": "no_input", "conversationId": conversation_id}
+                        directive = PREFIX_CMD_RE.match(clean_text)
+
+                    if directive and directive[1].upper().startswith("ADOPT:"):
+                        raw_target_tid = directive[1].split(":", 1)[1].strip()
+                        result = self.adopt_codex_thread(
+                            thread_id=raw_target_tid,
+                            conversation_id=conversation_id,
+                            parent_conversation_id=session.get("parentConversationId") or extracted_parent,
+                            role=role or session.get("role"),
+                            prompt=directive[2].strip() or None,
+                        )
                     else:
-                        result = self._dispatch_turn(session, clean_text, additional_context)
+                        is_new_thread = not bool(session.get("threadId"))
+                        if is_new_thread and not bypass_quota_check and not directive:
+                            quota = self.get_codex_quota()
+                            if quota.get("belowThreshold"):
+                                result = self._handle_quota_blocked(session, clean_text, quota)
+                                return result
+                        self._ensure_thread(session)
+                        if directive:
+                            result = self._execute_directive(session, directive[1].upper(), directive[2].strip())
+                        else:
+                            result = self._dispatch_turn(session, clean_text, additional_context)
             except Exception as e:
                 with self.lock:
                     if session["status"] == "starting" or not session.get("threadId"):
@@ -839,6 +859,384 @@ class UnifiedSubagentBridge:
                         inputs.pop(next(iter(inputs)))
                     self._save_state()
             return result
+
+    # -------------------------------------------------------------------------
+    # Antigravity ACP (`agy acp --stdio`) Backend Execution & Streaming
+    # -------------------------------------------------------------------------
+
+    def list_agy_models(self) -> Dict[str, Any]:
+        """Lists exact selectable Antigravity model IDs via ACP or `agy models`."""
+        models = self.agy.list_models()
+        return {
+            "agyAcpConnected": self.agy.is_connected(),
+            "models": models,
+        }
+
+    def _ensure_agy_session(self, session: Dict[str, Any]) -> str:
+        self.agy.connect()
+        connection = self.agy.connection
+        sid = session.get("threadId")
+        if sid:
+            with self.lock:
+                same_conn = sid in self._agy_connections and self._agy_connections[sid] is connection
+            if not same_conn:
+                self.agy.session_resume(sid, cwd=session.get("cwd") or os.getcwd())
+                if session.get("model"):
+                    try:
+                        self.agy.session_set_model(sid, session["model"])
+                    except Exception as e:
+                        logger.debug("ACP session_set_model on resume skipped: %s", e)
+                with self.lock:
+                    self._agy_connections[sid] = self.agy.connection
+            return sid
+
+        sys_prompt_parts = [
+            "You are running as a specialized Antigravity (AGY ACP) Subagent.",
+            f"Assigned Role: {session.get('role') or 'AGY Subagent'}",
+            f"Subagent Conversation ID: {session['conversationId']}",
+        ]
+        if session.get("parentConversationId"):
+            sys_prompt_parts.append(f"Parent Conversation ID: {session['parentConversationId']}")
+        if session.get("systemPrompt"):
+            sys_prompt_parts.append(session["systemPrompt"])
+
+        res = self.agy.session_new(
+            cwd=session.get("cwd") or os.getcwd(),
+            model=session.get("model") or None,
+            system_prompt="\n\n".join(sys_prompt_parts),
+            mode="auto",
+        )
+        sid = res.get("sessionId")
+        if not sid:
+            raise RuntimeError("AGY ACP session/new did not return a sessionId")
+        with self.lock:
+            session["threadId"] = sid
+            if res.get("selectedModelId"):
+                session["model"] = res["selectedModelId"]
+            self.conv_by_thread[sid] = session["conversationId"]
+            self._agy_connections[sid] = connection
+            self._save_state()
+        return sid
+
+    def _dispatch_agy_input(
+        self,
+        session: Dict[str, Any],
+        clean_text: str,
+        additional_context: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        conv_id = session["conversationId"]
+        directive = PREFIX_CMD_RE.match(clean_text)
+
+        if directive:
+            d_cmd = directive[1].upper()
+            remainder = directive[2].strip()
+
+            if d_cmd == "INTERRUPT":
+                with self.lock:
+                    sid = session.get("threadId")
+                    active = session.get("activeTurnId")
+                    if active:
+                        session["status"] = "interrupting"
+                if sid and active:
+                    self.agy.session_cancel(sid)
+                    self._record_event(session, "session/cancel", {"turnId": active})
+                    with self.turn_changed:
+                        self.turn_changed.wait_for(lambda: session.get("activeTurnId") != active, timeout=10.0)
+                if remainder:
+                    return self._start_agy_turn(session, remainder, additional_context)
+                return {
+                    "action": "session/cancel",
+                    "backend": "agy",
+                    "conversationId": conv_id,
+                    "threadId": sid,
+                    "interruptedTurnId": active,
+                }
+
+            if d_cmd.startswith("MODEL:"):
+                new_model = directive[1].split(":", 1)[1].strip()
+                cfg_res = self.configure_subagent(conv_id, model=new_model)
+                if remainder:
+                    return self._start_agy_turn(session, remainder, additional_context)
+                return {"action": "session/set_model", "backend": "agy", "model": new_model, **cfg_res}
+
+            if d_cmd == "QUEUE":
+                with self.lock:
+                    if session.get("activeTurnId"):
+                        self._agy_queued_prompts.setdefault(conv_id, []).append(remainder)
+                        self._record_event(session, "agy/queue/add", {"text": remainder[:200]})
+                        return {
+                            "action": "agy/queue/add",
+                            "backend": "agy",
+                            "conversationId": conv_id,
+                            "threadId": session.get("threadId"),
+                            "status": "queued",
+                        }
+                return self._start_agy_turn(session, remainder, additional_context)
+
+            if d_cmd == "STEER":
+                clean_text = remainder
+
+        # If a turn is already active on this ACP session, cancel it cleanly and restart with steered input
+        with self.lock:
+            active = session.get("activeTurnId")
+            sid = session.get("threadId")
+        if active and sid:
+            with self.lock:
+                session["status"] = "interrupting"
+            self.agy.session_cancel(sid)
+            with self.turn_changed:
+                self.turn_changed.wait_for(lambda: session.get("activeTurnId") != active, timeout=10.0)
+            steered_text = f"[LIVE STEER OVERRIDE]: {clean_text}"
+            res = self._start_agy_turn(session, steered_text, additional_context)
+            res["action"] = "agy/steer"
+            res["status"] = "steered"
+            return res
+
+        return self._start_agy_turn(session, clean_text, additional_context)
+
+    def _start_agy_turn(
+        self,
+        session: Dict[str, Any],
+        text: str,
+        context: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        cid = session["conversationId"]
+        sid = self._ensure_agy_session(session)
+        turn_id = f"agy-turn-{uuid.uuid4().hex[:10]}"
+        full_prompt = f"{text}\n\nAdditional context:\n{context}" if context else text
+
+        with self.lock:
+            self._append_transcript_step(session, {
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "content": text,
+            })
+            session.update(
+                activeTurnId=turn_id,
+                status="working",
+                currentActivity=f"AGY ({session.get('model')}) thinking...",
+                activityKind="thinking",
+                lastAgentMessage="",
+                lastThinking="",
+                latestDiff="",
+                plan=[],
+                planExplanation="",
+                idleSignal=None,
+                idleSignalTurnId=None,
+            )
+            self._sync_sqlite_status(cid, "CASCADE_RUN_STATUS_RUNNING", session["stepCount"], text[:160], 1)
+            self._record_event(session, "session/prompt", {"turnId": turn_id, "model": session.get("model"), "prompt": text[:200]})
+            self._save_state()
+
+        threading.Thread(
+            target=self._run_agy_turn_worker,
+            args=(session, sid, turn_id, full_prompt),
+            name=f"agy-turn-{cid[:12]}",
+            daemon=True,
+        ).start()
+
+        return {
+            "action": "turn/start",
+            "backend": "agy",
+            "conversationId": cid,
+            "threadId": sid,
+            "turnId": turn_id,
+            "model": session.get("model"),
+            "status": "working",
+        }
+
+    def _run_agy_turn_worker(self, session: Dict[str, Any], sid: str, turn_id: str, prompt_text: str) -> None:
+        result_status = "completed"
+        usage: Dict[str, Any] = {}
+        error_obj: Any = None
+        try:
+            res = self.agy.session_prompt(sid, prompt_text, timeout=3600.0)
+            stop_reason = (res or {}).get("stopReason", "end_turn")
+            usage = (res or {}).get("usage") or {}
+            if stop_reason == "cancelled":
+                result_status = "interrupted"
+        except Exception as e:
+            result_status = "failed"
+            error_obj = str(e)
+            logger.warning("AGY ACP turn %s on session %s failed: %s", turn_id, sid, e)
+        self._on_agy_turn_completed(session, turn_id, result_status, usage, error_obj)
+
+    def _on_agy_notification(self, method: str, params: Dict[str, Any]) -> None:
+        if method == "acp/disconnected":
+            with self.lock:
+                for sid, conn in list(self._agy_connections.items()):
+                    if conn is params.get("connection"):
+                        cid = self.conv_by_thread.get(sid)
+                        sess = self.sessions_by_conv.get(cid) if cid else None
+                        if sess and sess.get("activeTurnId"):
+                            sess.update(status="error", activeTurnId=None, currentActivity="AGY ACP process disconnected")
+                        self._agy_connections.pop(sid, None)
+                self.turn_changed.notify_all()
+                self._save_state()
+            return
+
+        if method != "session/update":
+            return
+        sid = params.get("sessionId")
+        update = params.get("update") or {}
+        utype = update.get("sessionUpdate", "")
+
+        with self.lock:
+            cid = self.conv_by_thread.get(sid) if sid else None
+            session = self.sessions_by_conv.get(cid) if cid else None
+            if not session or session.get("status") == "killed":
+                return
+
+            if utype == "agent_thought_chunk":
+                text = ((update.get("content") or {}).get("text") or "")
+                if text:
+                    session["lastThinking"] = (session.get("lastThinking", "") + text)[-4000:]
+                    lines = [ln.strip("*# ") for ln in session["lastThinking"].splitlines() if ln.strip()]
+                    if lines:
+                        session["currentActivity"] = lines[-1][:80]
+                        session["activityKind"] = "thinking"
+                    session["updatedAt"] = utc_now_iso()
+
+            elif utype == "agent_message_chunk":
+                text = ((update.get("content") or {}).get("text") or "")
+                if text:
+                    session["lastAgentMessage"] = session.get("lastAgentMessage", "") + text
+                    session["activityKind"] = "response"
+                    session["updatedAt"] = utc_now_iso()
+
+            elif utype == "tool_call":
+                title = str(update.get("title") or update.get("kind") or "tool")
+                tc_id = str(update.get("toolCallId") or uuid.uuid4())
+                session["currentActivity"] = f"Tool {title[:64]}"
+                session["activityKind"] = "tool"
+                self._append_transcript_step(session, {
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "model": session.get("model") or "agy",
+                    "thinking": session.get("lastThinking", "")[-1000:],
+                    "tool_calls": [{
+                        "id": tc_id,
+                        "name": title,
+                        "args": {"rawInput": json.dumps(update.get("rawInput") or {})[:500]},
+                    }],
+                })
+                self._record_event(session, "agy/tool_call", {"tool": title, "toolCallId": tc_id})
+
+            elif utype == "tool_call_update":
+                status_val = str(update.get("status") or "")
+                if status_val in ("completed", "failed"):
+                    raw_out = update.get("rawOutput")
+                    out_str = json.dumps(raw_out, ensure_ascii=False)[:2500] if raw_out is not None else status_val
+                    self._append_transcript_step(session, {
+                        "source": "MODEL",
+                        "type": "GENERIC",
+                        "status": "ERROR" if status_val == "failed" else "DONE",
+                        "content": f"Tool {update.get('title') or update.get('toolCallId')}: {out_str}",
+                    })
+
+            elif utype == "plan":
+                entries = update.get("entries") or []
+                session["plan"] = [
+                    {
+                        "step": e.get("content", ""),
+                        "status": e.get("status", "pending"),
+                    }
+                    for e in entries
+                    if isinstance(e, dict)
+                ]
+                session["updatedAt"] = utc_now_iso()
+
+            elif utype == "config_option_update":
+                for opt in (update.get("configOptions") or []):
+                    if isinstance(opt, dict) and opt.get("id") == "model" and opt.get("currentValue"):
+                        new_val = str(opt["currentValue"])
+                        cur_val = str(session.get("model") or "")
+                        if not cur_val or not cur_val.startswith(new_val):
+                            session["model"] = new_val
+
+    def _on_agy_turn_completed(
+        self,
+        session: Dict[str, Any],
+        turn_id: str,
+        result: str,
+        usage: Dict[str, Any],
+        error: Any,
+    ) -> None:
+        with self.lock:
+            conv_id = session["conversationId"]
+            sid = session.get("threadId") or ""
+            message = session.get("lastAgentMessage", "").strip()
+            thinking = session.get("lastThinking", "").strip()
+            role = session.get("role") or "AGY Subagent"
+            model_id = session.get("model") or "agy"
+            parent = session.get("parentConversationId", "")
+            credentials = self._session_credentials(session)
+
+            status = {"failed": "error", "interrupted": "interrupted"}.get(result, "idle")
+            session.update(
+                activeTurnId=None,
+                lastTerminalTurnId=turn_id,
+                status=status,
+                activityKind="",
+                currentActivity=f"Failed: {error}" if error else f"Turn {result}",
+            )
+            session.setdefault("turnHistory", []).append({
+                "turnId": turn_id,
+                "status": result,
+                "completedAt": utc_now_iso(),
+                "summary": message[:500],
+                **({"usage": usage} if usage else {}),
+            })
+            self._record_event(session, "agy/turn_completed", {"turnId": turn_id, "status": result, "model": model_id})
+            try:
+                self._append_transcript_step(session, {
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "ERROR" if result == "failed" else "DONE",
+                    "model": model_id,
+                    "thinking": thinking,
+                    "response": message or (f"Error: {error}" if error else f"Turn {result}"),
+                    "tool_calls": [],
+                    **({"error": str(error)} if error else {}),
+                })
+            except OSError:
+                logger.exception("Failed to write completed AGY turn %s to transcript", turn_id)
+            self._sync_sqlite_status(
+                conv_id, "CASCADE_RUN_STATUS_IDLE", session["stepCount"], message or f"Turn {result}", 0
+            )
+            self._schedule_sdk_idle(session, turn_id)
+            self._save_state()
+            self.turn_changed.notify_all()
+            queued = self._agy_queued_prompts.get(conv_id) or []
+            next_prompt = queued.pop(0) if (queued and result == "completed") else None
+
+        if parent:
+            report = [
+                f"### AGY Subagent Report (`{role}` · `{model_id}`)",
+                f"- **Subagent Conversation**: [{role}](conversation://{conv_id})",
+                f"- **AGY ACP Session / Turn**: `{sid}` / `{turn_id}` (`{result}`)",
+            ]
+            if message:
+                report.append(f"\n{message}")
+            if error:
+                report.append(f"\n**Error Details**: `{error}`")
+            threading.Thread(
+                target=self.send_message_to_agy_conversation,
+                kwargs={
+                    "recipient_id": parent,
+                    "sender_id": conv_id,
+                    "title": f"AGY Subagent ({role} · {model_id}) Turn Completed",
+                    "content": "\n".join(report),
+                    **credentials,
+                },
+                name="agy-parent-report",
+                daemon=True,
+            ).start()
+
+        if next_prompt:
+            self._start_agy_turn(session, next_prompt)
 
     def _ensure_thread(self, session: Dict[str, Any]) -> None:
         self.codex.connect()
@@ -1711,6 +2109,8 @@ class UnifiedSubagentBridge:
             tp = self._transcript_path_for(sess)
             tr = summarize_transcript_file(tp, max_steps=15)
             conv_approvals = [a for a in approvals_copy if a.get("conversationId") == cid]
+            sess_backend = sess.get("backend", "codex")
+            sess_engine = "agy" if sess_backend == "agy" else "codex"
 
             existing = items_by_conv.get(cid, {})
             items_by_conv[cid] = {
@@ -1718,11 +2118,12 @@ class UnifiedSubagentBridge:
                 "conversationId": cid,
                 "parentConversationId": parent_id or existing.get("parentConversationId", ""),
                 "nestingDepth": existing.get("nestingDepth", 1),
-                "engine": "codex",
+                "engine": sess_engine,
+                "backend": sess_backend,
                 "agentName": sess.get("agentName", "codex"),
                 "executionMode": sess.get("executionMode", "preInvocation"),
-                "role": sess.get("role") or existing.get("role") or "Codex Engineer",
-                "model": sess.get("model") or existing.get("model") or "gpt-5.4",
+                "role": sess.get("role") or existing.get("role") or ("AGY Subagent" if sess_engine == "agy" else "Codex Engineer"),
+                "model": sess.get("model") or existing.get("model") or "gpt-6.2-sol",
                 "effort": sess.get("effort") or "high",
                 "status": "awaiting_approval" if conv_approvals else sess.get("status", "idle"),
                 "steps": max(int(sess.get("stepCount") or 0), int(tr.get("steps") or 0)),
@@ -1899,6 +2300,8 @@ class UnifiedSubagentBridge:
                 if sdk_instance and (not session or sdk_instance != session.get("sdkInstanceId")):
                     raise ValueError("SDK executor registration is no longer current")
             if session:
+                if session.get("backend") == "agy":
+                    return self._dispatch_agy_input(session, "[INTERRUPT]")
                 return self._execute_directive(session, "INTERRUPT", "")
 
         # Gemini native subagent: call CancelCascadeInvocation
@@ -1917,24 +2320,41 @@ class UnifiedSubagentBridge:
                 tid = session.get("threadId") if session else None
                 credentials = self._session_credentials(session or {})
             if session:
-                try:
-                    self._execute_directive(session, "INTERRUPT", "")
-                except Exception as e:
-                    results["codexError"] = str(e)
-                if tid:
+                if session.get("backend") == "agy":
                     try:
-                        self.codex.thread_unsubscribe(tid)
+                        if tid:
+                            self.agy.session_cancel(tid)
+                            self.agy.session_close(tid)
                     except Exception as e:
-                        results["unsubscribeError"] = str(e)
-                with self.lock:
+                        results["agyError"] = str(e)
+                    with self.lock:
+                        if tid:
+                            self._agy_connections.pop(tid, None)
+                            self.conv_by_thread.pop(tid, None)
+                        self._agy_queued_prompts.pop(conversation_id, None)
+                        session.update(activeTurnId=None, status="killed", currentActivity="Killed", activityKind="")
+                        self._save_state()
+                        self.turn_changed.notify_all()
+                    results["agy"] = "terminated"
+                else:
+                    try:
+                        self._execute_directive(session, "INTERRUPT", "")
+                    except Exception as e:
+                        results["codexError"] = str(e)
                     if tid:
-                        self._clear_turn_resources(tid)
-                        self._thread_connections.pop(tid, None)
-                        self.conv_by_thread.pop(tid, None)
-                    session.update(activeTurnId=None, status="killed", currentActivity="Killed", activityKind="")
-                    self._save_state()
-                    self.turn_changed.notify_all()
-                results["codex"] = "interrupt_failed" if "codexError" in results else "terminated"
+                        try:
+                            self.codex.thread_unsubscribe(tid)
+                        except Exception as e:
+                            results["unsubscribeError"] = str(e)
+                    with self.lock:
+                        if tid:
+                            self._clear_turn_resources(tid)
+                            self._thread_connections.pop(tid, None)
+                            self.conv_by_thread.pop(tid, None)
+                        session.update(activeTurnId=None, status="killed", currentActivity="Killed", activityKind="")
+                        self._save_state()
+                        self.turn_changed.notify_all()
+                    results["codex"] = "interrupt_failed" if "codexError" in results else "terminated"
 
         if credentials["ls_address"]:
             try:
@@ -2047,17 +2467,18 @@ class UnifiedSubagentBridge:
             f"---\n### Your Task\n{prompt}"
         )
 
-        if target_engine == "codex":
-            new_conv_id = f"codex-handoff-{uuid.uuid4().hex[:12]}"
+        if target_engine in ("codex", "agy"):
+            new_conv_id = f"{target_engine}-handoff-{uuid.uuid4().hex[:12]}"
             res = self.dispatch_subagent_input(
                 conversation_id=new_conv_id,
                 parent_conversation_id=parent_id,
                 cwd=cwd,
-                role=new_role or f"Codex Handoff ({source_role})",
+                role=new_role or f"{target_engine.upper()} Handoff ({source_role})",
                 user_input=handoff_context,
+                backend=target_engine,
             )
             return {
-                "action": "handoff_to_codex",
+                "action": f"handoff_to_{target_engine}",
                 "sourceConversationId": source_conversation_id,
                 "newConversationId": new_conv_id,
                 "threadId": res.get("threadId"),
@@ -2734,6 +3155,7 @@ class UnifiedSubagentBridge:
             result: Dict[str, Any] = {
                 "conversationId": conversation_id,
                 "threadId": tid,
+                "backend": session.get("backend", "codex"),
                 "model": session.get("model"),
                 "effort": session.get("effort"),
                 "permissionSource": session.get("permissionSource", "codexConfig"),
@@ -2741,6 +3163,12 @@ class UnifiedSubagentBridge:
                 "sandboxMode": session.get("sandbox"),
                 "approvalMode": session.get("approvalMode"),
             }
+            if session.get("backend") == "agy":
+                if tid and model is not None:
+                    self._ensure_agy_session(session)
+                    result["settingsUpdate"] = self.agy.session_set_model(tid, model)
+                    self._record_event(session, "session/set_model", {"model": model})
+                return result
             if tid and (perm_changed or model is not None or effort is not None):
                 try:
                     self._ensure_thread(session)
@@ -2881,6 +3309,10 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                 self._send_json(200, BRIDGE_INSTANCE.get_codex_quota(threshold_percent=thr, use_cache=False))
                 return
 
+            if parsed.path == "/api/agy/models":
+                self._send_json(200, BRIDGE_INSTANCE.list_agy_models())
+                return
+
             self._send_json(404, {"error": f"Unknown GET endpoint: {parsed.path}"})
         except ValueError as e:
             self._send_json(400, {"error": str(e)})
@@ -2944,6 +3376,7 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                     sdk_instance=body.get("sdkInstanceId"),
                     input_id=body.get("inputId"),
                     bypass_quota_check=bool(body.get("bypassQuotaCheck", False)),
+                    backend=body.get("backend"),
                 )
                 self._send_json(200, res)
                 return
@@ -3102,6 +3535,7 @@ def main() -> None:
             pass
         finally:
             BRIDGE_INSTANCE.codex.close()
+            BRIDGE_INSTANCE.agy.close()
 
 
 if __name__ == "__main__":

@@ -251,6 +251,7 @@ cd agy-codex-subagent
 | `subagent_configure` | **Codex** | Live updates `model`, `effort`, `permissionSource` (`codexConfig` / `bypass` / `custom`), `approvalPolicy`, `sandboxMode`, or triggers `compact` |
 | `subagent_handoff` | **Codex ⇄ Gemini** | Transfers latest thinking, findings, and workspace directory from `research`/`self` to `codex` (or vice versa) |
 | `subagent_check_codex_quota` | **Codex** | Checks live remaining Codex quota/rate limits (`account/rateLimits/read`) before launching; blocks & asks user if below `minRemainingQuotaPercent` |
+| `subagent_list_agy_models` | **AGY ACP** | Lists all exact selectable Antigravity model IDs (`claude-opus-5-5-high`, `claude-sonnet-5-5-high`, `gemini-4-neon-xhigh`, `gemini-4-argon-high`, `gpt-oss-120b-medium`, etc.) |
 | `subagent_list_codex_sessions` | **Codex** | Lists loaded in-memory threads (`thread/loaded/list`) and persisted sessions (`thread/list`) from `codex app-server` |
 | `subagent_adopt_codex_session` | **Codex** | Directly takes over an existing Codex `threadId`, imports its historical turns into `transcript.jsonl`, and applies permissions |
 | `subagent_define_profile` | **Codex** | Creates or updates a specialized Codex subagent profile and registers its native Antigravity subagent definition |

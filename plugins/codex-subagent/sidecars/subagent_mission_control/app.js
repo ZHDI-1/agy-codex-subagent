@@ -302,6 +302,7 @@ async function pollAll() {
 // Event Listeners
 const profileFields = {
   name: 'profile-name',
+  backend: 'profile-backend',
   description: 'profile-description',
   model: 'profile-model',
   effort: 'profile-effort',

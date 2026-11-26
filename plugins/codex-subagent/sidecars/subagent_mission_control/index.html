@@ -115,19 +115,33 @@
           <form id="profile-form">
             <div class="form-row">
               <label for="profile-name">Agent name</label>
-              <input id="profile-name" placeholder="codex-reviewer" pattern="[a-z][a-z0-9]*(?:-[a-z0-9]+)*" maxlength="64" required />
+              <input id="profile-name" placeholder="codex-reviewer or agy-opus" pattern="[a-z][a-z0-9]*(?:-[a-z0-9]+)*" maxlength="64" required />
+            </div>
+            <div class="form-row">
+              <label for="profile-backend">Backend</label>
+              <select id="profile-backend">
+                <option value="codex">codex (OpenAI Codex app-server)</option>
+                <option value="agy">agy (Antigravity ACP — exact model)</option>
+              </select>
             </div>
             <div class="form-row">
               <label for="profile-description">Description</label>
               <input id="profile-description" />
             </div>
             <div class="form-row">
-              <label for="profile-model">Codex model</label>
+              <label for="profile-model">Model ID</label>
               <input id="profile-model" list="profile-models" required />
               <datalist id="profile-models">
                 <option value="gpt-6.2-sol"></option>
                 <option value="gpt-5.4"></option>
                 <option value="o3"></option>
+                <option value="claude-opus-5-5-high"></option>
+                <option value="claude-sonnet-5-5-high"></option>
+                <option value="gemini-4-neon-xhigh"></option>
+                <option value="gemini-4-neon-high"></option>
+                <option value="gemini-4-argon-high"></option>
+                <option value="gemini-3.8-flash-high"></option>
+                <option value="gpt-oss-120b-medium"></option>
               </datalist>
             </div>
             <div class="form-row">

@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from codex_profiles import APPROVAL_POLICIES, EFFORTS, EXECUTION_MODES, PERMISSION_SOURCES, SANDBOX_MODES
+from codex_profiles import APPROVAL_POLICIES, BACKENDS, EFFORTS, EXECUTION_MODES, PERMISSION_SOURCES, SANDBOX_MODES
 from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running
 
 
@@ -66,12 +66,22 @@ def bridge_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 MCP_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "subagent_define_profile",
-        "description": "Create or update a Codex profile and register its native Antigravity subagent type.",
+        "description": (
+            "Create or update a subagent profile (backend='codex' or backend='agy') and register "
+            "its native Antigravity subagent type. With backend='agy', you can pin any exact Antigravity "
+            "model ID (e.g. 'claude-opus-5-5-high', 'claude-sonnet-5-5-high', 'gemini-4-neon-xhigh', "
+            "'gemini-4-argon-high', 'gpt-oss-120b-medium') via `agy acp`!"
+        ),
         "inputSchema": {
             "type": "object",
             "required": ["name"],
             "properties": {
                 "name": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"},
+                "backend": {
+                    "type": "string",
+                    "enum": BACKENDS,
+                    "description": "'codex' (default, OpenAI Codex app-server) or 'agy' (Antigravity ACP with exact model selection).",
+                },
                 "description": {"type": "string"},
                 "model": {"type": "string"},
                 "effort": {"type": "string", "enum": EFFORTS},
@@ -93,7 +103,16 @@ MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "subagent_list_profiles",
-        "description": "List saved Codex profiles and defaults for new profiles (including ~/.codex/config.toml permissions).",
+        "description": "List saved Codex & AGY profiles and defaults for new profiles (including ~/.codex/config.toml permissions).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "subagent_list_agy_models",
+        "description": (
+            "List all exact selectable Antigravity model IDs supported by the `agy` ACP backend "
+            "(e.g. `claude-opus-5-5-high`, `claude-sonnet-5-5-high`, `gemini-4-neon-xhigh`, "
+            "`gemini-4-argon-high`, `gemini-3.8-flash-high`, `gpt-oss-120b-medium`)."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -409,8 +428,8 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                 },
                 "targetEngine": {
                     "type": "string",
-                    "enum": ["codex", "gemini"],
-                    "description": "Target engine to hand off to ('codex' or 'gemini').",
+                    "enum": ["codex", "agy", "gemini"],
+                    "description": "Target engine to hand off to ('codex', 'agy', or 'gemini').",
                 },
                 "prompt": {
                     "type": "string",
@@ -432,6 +451,8 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Any:
         return bridge_post("/api/profiles/define", args)
     if name == "subagent_list_profiles":
         return bridge_get("/api/profiles")
+    if name == "subagent_list_agy_models":
+        return bridge_get("/api/agy/models")
     if name == "subagent_check_codex_quota":
         params = {}
         if args.get("thresholdPercent") is not None:

@@ -212,7 +212,7 @@ class TestExecutorAndProfiles(unittest.TestCase):
         print(output.rstrip())
 
     def test_profile_provider_routes_and_persists(self):
-        profile = {"name": "codex-reviewer", "description": "Review: change",
+        profile = {"name": "codex-reviewer", "backend": "codex", "description": "Review: change",
                    "model": "o3", "effort": "ultra", "systemPrompt": "Review the patch.",
                    "permissionSource": "custom", "minRemainingQuotaPercent": 10,
                    "sandboxMode": "read-only", "approvalPolicy": "on-request", "executionMode": "sdkExecutor"}
@@ -336,6 +336,74 @@ class TestExecutorAndProfiles(unittest.TestCase):
             self.assertEqual(sum(m == "thread/start" for m, _ in self.codex.calls), 1)
             turn_call = next(p for m, p in self.codex.calls if m == "turn/start")
             self.assertIn("Refactor lockless queue", turn_call["input"][0]["text"])
+
+    def test_agy_acp_backend_profile_dispatch_and_model_switch(self):
+        agy_calls = []
+
+        class FakeAgyAcp:
+            def __init__(self, bridge):
+                self.bridge = bridge
+                self.connected = True
+
+            def connect(self):
+                return {"agentInfo": {"name": "Fake ACP"}}
+
+            def is_connected(self):
+                return self.connected
+
+            @property
+            def connection(self):
+                return self
+
+            def session_new(self, cwd, model=None, system_prompt=None, mode=None):
+                agy_calls.append(("session/new", {"cwd": cwd, "model": model, "system_prompt": system_prompt}))
+                return {"sessionId": "acp-sess-1", "selectedModelId": model or "gemini-4-neon-high"}
+
+            def session_set_model(self, sid, model_id):
+                agy_calls.append(("session/set_model", {"sessionId": sid, "modelId": model_id}))
+                return {}
+
+            def session_prompt(self, sid, text, timeout=3600.0):
+                agy_calls.append(("session/prompt", {"sessionId": sid, "text": text}))
+                self.bridge._on_agy_notification("session/update", {
+                    "sessionId": sid,
+                    "update": {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "Analyzing..."}},
+                })
+                self.bridge._on_agy_notification("session/update", {
+                    "sessionId": sid,
+                    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "OPUS_REPLY_OK"}},
+                })
+                return {"stopReason": "end_turn", "usage": {"totalTokens": 42}}
+
+            def session_cancel(self, sid):
+                agy_calls.append(("session/cancel", {"sessionId": sid}))
+
+            def list_models(self):
+                return [{"modelId": "claude-opus-5-5-high", "name": "Claude Opus 5.5 (High)"}]
+
+        self.bridge.agy = FakeAgyAcp(self.bridge)
+        res_def = self.bridge.define_profile({
+            "name": "agy-opus",
+            "backend": "agy",
+            "model": "claude-opus-5-5-high",
+            "systemPrompt": "Use Opus precision.",
+            "executionMode": "sdkExecutor",
+        })
+        self.assertEqual(res_def["profile"]["backend"], "agy")
+        self.assertEqual(res_def["profile"]["model"], "claude-opus-5-5-high")
+
+        disp = self.bridge.dispatch_subagent_input("agy-conv-1", "Audit design", agent_name="agy-opus")
+        self.assertEqual(disp["backend"], "agy")
+        self.assertEqual(disp["model"], "claude-opus-5-5-high")
+        wait_until(lambda: self.bridge.sessions_by_conv["agy-conv-1"]["status"] == "idle", timeout=3)
+        insp = self.bridge.inspect_subagent("agy-conv-1")
+        self.assertEqual(insp["summary"]["engine"], "agy")
+        self.assertIn("OPUS_REPLY_OK", insp["transcript"]["lastResponse"])
+
+        # Live model switch via [MODEL:...]
+        sw = self.bridge.dispatch_subagent_input("agy-conv-1", "[MODEL:gemini-4-neon-xhigh]")
+        self.assertEqual(sw["model"], "gemini-4-neon-xhigh")
+        self.assertTrue(any(m == "session/set_model" and p["modelId"] == "gemini-4-neon-xhigh" for m, p in agy_calls))
 
     def test_serialized_dispatch_steers_and_cleans_approvals(self):
         conv = "concurrent"
@@ -892,6 +960,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "subagent_handoff",
                 "subagent_define_profile",
                 "subagent_list_profiles",
+                "subagent_list_agy_models",
                 "subagent_check_codex_quota",
                 "subagent_list_codex_sessions",
                 "subagent_adopt_codex_session",
@@ -899,7 +968,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
             self.assertEqual(tool_names, expected_tools)
 
             profile = {
-                "name": "codex-e2e-reviewer", "description": "Reviews tests", "model": "gpt-6.2-sol",
+                "name": "codex-e2e-reviewer", "backend": "codex", "description": "Reviews tests", "model": "gpt-6.2-sol",
                 "effort": "medium", "systemPrompt": "You are the e2e reviewer.", "executionMode": "sdkExecutor",
                 "permissionSource": "custom", "minRemainingQuotaPercent": 10,
                 "sandboxMode": "read-only", "approvalPolicy": "on-request",
@@ -1150,6 +1219,46 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 stop_process(proc)
                 ls.shutdown()
                 serving.join(timeout=3)
+
+    def test_08_agy_acp_exact_model_end_to_end(self) -> None:
+        """Verify live exact-model AGY ACP subagent execution and live model switching."""
+        models_res = http_get_json(f"{self.bridge_url}/api/agy/models")
+        self.assertGreaterEqual(len(models_res.get("models") or []), 5)
+
+        conv_id = f"agy-e2e-{uuid.uuid4().hex[:8]}"
+        disp = http_post_json(
+            f"{self.bridge_url}/api/dispatch",
+            {
+                "conversationId": conv_id,
+                "backend": "agy",
+                "model": "gemini-3.8-flash-low",
+                "role": "AGY Flash E2E",
+                "cwd": str(REPO_ROOT),
+                "userInput": "Reply with the exact word AGY_ACP_PONG and do not call any tools.",
+            },
+        )
+        self.assertEqual(disp.get("backend"), "agy")
+        self.assertEqual(disp.get("model"), "gemini-3.8-flash-low")
+        self.assertTrue(disp.get("threadId"))
+
+        wait_until(
+            lambda: http_get_json(f"{self.bridge_url}/api/subagent/inspect?conversationId={conv_id}")["summary"]["status"] == "idle",
+            timeout=40,
+        )
+        insp = http_get_json(f"{self.bridge_url}/api/subagent/inspect?conversationId={conv_id}")
+        self.assertEqual(insp["summary"]["engine"], "agy")
+        self.assertIn("AGY_ACP_PONG", insp["transcript"]["lastResponse"])
+
+        # Live model switch via /api/subagent/configure
+        cfg = http_post_json(
+            f"{self.bridge_url}/api/subagent/configure",
+            {"conversationId": conv_id, "model": "claude-sonnet-5-5-low"},
+        )
+        self.assertEqual(cfg.get("model"), "claude-sonnet-5-5-low")
+        print(
+            f"  [Phase 4 AGY ACP] Verified live exact-model AGY ACP session={disp['threadId']}, "
+            f"response={insp['transcript']['lastResponse'].strip()!r}, switched model -> claude-sonnet-5-5-low"
+        )
 
 
 if __name__ == "__main__":

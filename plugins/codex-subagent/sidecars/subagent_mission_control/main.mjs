@@ -266,6 +266,7 @@ app.api('/api/profiles/define', (data) => bridgePost('/api/profiles/define', dat
 app.api('/api/profiles/delete', (data) => bridgePost('/api/profiles/delete', data), 'POST');
 app.api('/api/codex/threads', (data) => bridgeGet('/api/codex/threads', data), 'GET');
 app.api('/api/codex/quota', (data) => bridgeGet('/api/codex/quota', data), 'GET');
+app.api('/api/agy/models', () => bridgeGet('/api/agy/models'), 'GET');
 app.api('/api/codex/adopt', (data) => bridgePost('/api/codex/adopt', {
   parentConversationId: data.parentConversationId || app.config.conversationId || '',
   ...data,

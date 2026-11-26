@@ -268,8 +268,9 @@ def plugin_owns(path: Path, name: str) -> bool:
             if target.parts[-4:] == ("plugins", "codex-subagent", "agents", "codex.md"):
                 return True
         contents = path.read_text(encoding="utf-8")
+        bundled = PLUGIN_DIR / "agents/codex.md"
         return MARKDOWN_MARKER in contents or (
-            name == "codex" and contents == (PLUGIN_DIR / "agents/codex.md").read_text(encoding="utf-8")
+            name == "codex" and bundled.is_file() and contents == bundled.read_text(encoding="utf-8")
         )
     except OSError:
         return False
@@ -350,7 +351,8 @@ def install(mode: str) -> None:
         [sys.executable, str(PLUGIN_DIR / "bin/codex_hook_intercept.py")]
     )
     mcp = read_object(PLUGIN_DIR / "mcp_config.json")
-    mcp["mcpServers"]["codex-subagent-control"].update({
+    server_key = "ctl" if "ctl" in mcp.get("mcpServers", {}) else next(iter(mcp.get("mcpServers", {})), "ctl")
+    mcp.setdefault("mcpServers", {}).setdefault(server_key, {}).update({
         "command": sys.executable,
         "args": ["-u", str(PLUGIN_DIR / "bin/codex_mcp_server.py")],
     })

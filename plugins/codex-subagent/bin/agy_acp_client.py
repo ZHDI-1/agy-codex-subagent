@@ -26,7 +26,7 @@ class AgyAcpClient(GenericAcpClient):
         self,
         agy_exe: Optional[str] = None,
         auto_start: bool = True,
-        dangerously_skip_permissions: bool = True,
+        dangerously_skip_permissions: bool = False,
     ) -> None:
         self.agy_exe = agy_exe or shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
         cmd = [self.agy_exe, "acp", "--stdio"]
@@ -36,6 +36,7 @@ class AgyAcpClient(GenericAcpClient):
             cmd,
             auto_start=auto_start,
             default_mode="auto",
+            auto_approve=dangerously_skip_permissions,
             name="agy",
             system_prompt_meta_builder=lambda prompt: {"antigravity": {"systemPrompt": {"append": prompt}}},
         )

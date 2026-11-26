@@ -56,16 +56,18 @@ from codex_bridge_daemon import UnifiedSubagentBridge, summarize_transcript_file
 from codex_ws_client import CodexAppServerClient
 
 
-def http_get_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=15.0) as resp:
+def http_get_json(url: str, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    with urllib.request.urlopen(req, timeout=15.0) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def http_post_json(url: str, payload: dict) -> dict:
+def http_post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
+    hdrs = {"Content-Type": "application/json", **(headers or {})}
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=hdrs,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=25.0) as resp:
@@ -336,6 +338,87 @@ class TestExecutorAndProfiles(unittest.TestCase):
             self.assertEqual(sum(m == "thread/start" for m, _ in self.codex.calls), 1)
             turn_call = next(p for m, p in self.codex.calls if m == "turn/start")
             self.assertIn("Refactor lockless queue", turn_call["input"][0]["text"])
+
+            # Verify [STEER] on a brand-new thread is also quota-checked and failed [FORCE] preserves pending prompt
+            blocked_steer = self.bridge.dispatch_subagent_input(
+                "quota-conv-2", "[STEER] Fix lock order", parent_conversation_id="parent-123"
+            )
+            self.assertEqual(blocked_steer["action"], "quota_blocked")
+
+            def failing_start(method, params=None, timeout=60):
+                if method == "thread/start":
+                    raise RuntimeError("transient start failure")
+                return quota_request(method, params, timeout)
+
+            with patch.object(self.codex, "request", side_effect=failing_start):
+                with self.assertRaises(RuntimeError):
+                    self.bridge.dispatch_subagent_input("quota-conv-2", "[FORCE]")
+            # Pending prompt must still be preserved after failed [FORCE]
+            self.assertIn("Fix lock order", self.bridge.sessions_by_conv["quota-conv-2"].get("pendingQuotaPrompt", ""))
+            retried = self.bridge.dispatch_subagent_input("quota-conv-2", "[FORCE]")
+            self.assertEqual(retried["action"], "turn/start")
+
+    def test_security_fail_closed_and_redaction(self):
+        # 1. Missing and malformed config.toml must fail closed to on-request + workspace-write
+        missing = codex_profiles.read_codex_config_toml(self.root / "nonexistent.toml")
+        self.assertEqual((missing["approvalPolicy"], missing["sandboxMode"]), ("on-request", "workspace-write"))
+        malformed = self.root / "bad.toml"
+        malformed.write_text("approval_policy = [broken\n")
+        bad_cfg = codex_profiles.read_codex_config_toml(malformed)
+        self.assertEqual((bad_cfg["approvalPolicy"], bad_cfg["sandboxMode"]), ("on-request", "workspace-write"))
+
+        # 2. sandbox_mode_to_policy defaults networkAccess=False
+        self.assertFalse(CodexAppServerClient.sandbox_mode_to_policy("workspace-write")["networkAccess"])
+        self.assertFalse(CodexAppServerClient.sandbox_mode_to_policy("read-only")["networkAccess"])
+
+        # 3. list_profiles redacts acpEnv secrets
+        self.bridge.define_profile({
+            "name": "acp-secret-test",
+            "backend": "acp",
+            "acpCommand": ["pi-acp", "--stdio"],
+            "acpEnv": {"API_TOKEN": "super-secret-value"},
+        })
+        listed = {p["name"]: p for p in self.bridge.list_profiles()["profiles"]}
+        self.assertEqual(listed["acp-secret-test"]["acpEnv"], {"API_TOKEN": "***"})
+
+    def test_acp_killed_guard_pi_rollback_and_unsupported_ops(self):
+        # 1. Late ACP completion must not overwrite status == "killed"
+        self.bridge.sessions_by_conv["acp-killed"] = {
+            "conversationId": "acp-killed",
+            "backend": "agy",
+            "status": "killed",
+            "activeTurnId": "turn-1",
+            "turnHistory": [],
+            "events": [],
+        }
+        self.bridge._on_agy_turn_completed(
+            self.bridge.sessions_by_conv["acp-killed"], "turn-1", "end_turn", {}, None
+        )
+        self.assertEqual(self.bridge.sessions_by_conv["acp-killed"]["status"], "killed")
+
+        # 2. Unsupported revert/fork on agy/pi raise ValueError
+        with self.assertRaises(ValueError):
+            self.bridge.revert_subagent("acp-killed", 1)
+        with self.assertRaises(ValueError):
+            self.bridge.fork_subagent("acp-killed")
+
+        # 3. Rejected Pi prompt rolls back activeTurnId and marks status="error"
+        class FailingPiProc:
+            def is_running(self):
+                return True
+
+            def command(self, cmd_type, payload=None, timeout=30.0):
+                raise RuntimeError("pi rejected prompt")
+
+            def close(self):
+                pass
+
+        with patch.object(self.bridge.backends.pi, "get_or_create", return_value=FailingPiProc()):
+            with self.assertRaises(RuntimeError):
+                self.bridge.dispatch_subagent_input("pi-fail-conv", "Run task", backend="pi")
+        sess = self.bridge.sessions_by_conv["pi-fail-conv"]
+        self.assertIsNone(sess.get("activeTurnId"))
+        self.assertEqual(sess.get("status"), "error")
 
     def test_agy_acp_backend_profile_dispatch_and_model_switch(self):
         agy_calls = []
@@ -771,6 +854,17 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                                 env=cls.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cls.addClassCleanup(stop_process, proc)
         wait_until(lambda: http_get_json(f"{cls.bridge_url}/api/ready").get("status") == "ok", timeout=5)
+        token_path = cls.temp_dir / "codex_bridge_token"
+        wait_until(lambda: token_path.is_file() and token_path.read_text(encoding="utf-8").strip(), timeout=5)
+        cls.bridge_headers = {"X-Bridge-Token": token_path.read_text(encoding="utf-8").strip()}
+
+    def test_01_bridge_auth_enforcement(self) -> None:
+        """Verify bridge requires X-Bridge-Token on non-health endpoints (401 without, 200 with)."""
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            http_get_json(f"{self.bridge_url}/api/backends")
+        self.assertEqual(ctx.exception.code, 401)
+        authed = http_get_json(f"{self.bridge_url}/api/backends", headers=self.bridge_headers)
+        self.assertIn("backends", authed)
 
     def test_02_phase1_direct_codex_daemon_websocket(self) -> None:
         """Verify direct AF_UNIX WebSocket connection & JSON-RPC handshake with codex app-server daemon."""
@@ -823,6 +917,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "effort": "low",
                 "userInput": "Reply with the exact word PONG_PHASE1 and do not run any shell commands.",
             },
+            headers=self.bridge_headers,
         )
         self.assertEqual(dispatch_res.get("action"), "turn/start")
         thread_id = dispatch_res.get("threadId")
@@ -837,7 +932,8 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
         inspected = {}
         while time.time() < deadline:
             inspected = http_get_json(
-                f"{self.bridge_url}/api/subagent/inspect?conversationId={urllib.parse.quote(self.test_conv_id)}"
+                f"{self.bridge_url}/api/subagent/inspect?conversationId={urllib.parse.quote(self.test_conv_id)}",
+                headers=self.bridge_headers,
             )
             st = (inspected.get("summary") or {}).get("status")
             if st in ("idle", "error") and (inspected.get("transcript") or {}).get("steps", 0) >= 2:
@@ -919,7 +1015,8 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
         self.assertNotIn("errorMessage", json.loads(proc_filestore.stdout)["injectSteps"][0])
         self.assertFalse(marker_path.exists(), "undelivered/<msg_id> marker should be unlinked by codex_hook_intercept.py")
         insp_after = http_get_json(
-            f"{self.bridge_url}/api/subagent/inspect?conversationId={urllib.parse.quote(self.test_conv_id)}"
+            f"{self.bridge_url}/api/subagent/inspect?conversationId={urllib.parse.quote(self.test_conv_id)}",
+            headers=self.bridge_headers,
         )
         self.assertEqual(insp_after["summary"].get("effort"), "high")
         print("  [Phase 1] PreInvocation hook drained .system_generated/messages/undelivered/<msg_id> and applied [EFFORT:high]")
@@ -936,6 +1033,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "conversationId": self.test_conv_id,
                 "userInput": "Think carefully about 3 ways to design a lock-free queue in Rust before answering briefly.",
             },
+            headers=self.bridge_headers,
         )
         self.assertIn(start_res.get("action"), ("turn/start", "turn/steer"))
         active_turn = start_res.get("turnId")
@@ -950,6 +1048,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "message": "STEER OVERRIDE: Include the token STEER_SUCCESS_TOKEN in your response and keep it to 1 sentence.",
                 "mode": "steer",
             },
+            headers=self.bridge_headers,
         )
         print(f"  [Phase 2] Mid-turn steer result: {steer_res}")
         self.assertIn(steer_res.get("action"), ("turn/steer", "turn/start"))
@@ -958,7 +1057,8 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
         deadline = time.time() + 45.0
         while time.time() < deadline:
             insp = http_get_json(
-                f"{self.bridge_url}/api/subagent/inspect?conversationId={urllib.parse.quote(self.test_conv_id)}"
+                f"{self.bridge_url}/api/subagent/inspect?conversationId={urllib.parse.quote(self.test_conv_id)}",
+                headers=self.bridge_headers,
             )
             if (insp.get("summary") or {}).get("status") == "idle":
                 break
@@ -971,6 +1071,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "conversationId": self.test_conv_id,
                 "newRole": "Forked Codex Verifier",
             },
+            headers=self.bridge_headers,
         )
         self.assertEqual(fork_res.get("action"), "thread/fork")
         self.assertTrue(fork_res.get("newThreadId"))
@@ -984,6 +1085,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "conversationId": self.test_conv_id,
                 "stepOrTurns": 1,
             },
+            headers=self.bridge_headers,
         )
         self.assertEqual(revert_res.get("action"), "thread/revert")
         print(f"  [Phase 2] Reverted last turn on thread: {revert_res.get('action')}")
@@ -1264,7 +1366,10 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                     proc.stdin.flush()
 
                 def snapshot():
-                    return http_get_json(f"{self.bridge_url}/api/subagent/inspect?conversationId={conv}")
+                    return http_get_json(
+                        f"{self.bridge_url}/api/subagent/inspect?conversationId={conv}",
+                        headers=self.bridge_headers,
+                    )
 
                 send({"type": "init", "conversation_id": conv, "language_server_address": f"127.0.0.1:{ls.server_port}",
                       "csrf_token": "fixture-csrf"})
@@ -1293,7 +1398,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
 
     def test_08_agy_acp_exact_model_end_to_end(self) -> None:
         """Verify live exact-model AGY ACP subagent execution and live model switching."""
-        models_res = http_get_json(f"{self.bridge_url}/api/agy/models")
+        models_res = http_get_json(f"{self.bridge_url}/api/agy/models", headers=self.bridge_headers)
         self.assertGreaterEqual(len(models_res.get("models") or []), 5)
 
         conv_id = f"agy-e2e-{uuid.uuid4().hex[:8]}"
@@ -1307,16 +1412,23 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "cwd": str(REPO_ROOT),
                 "userInput": "Reply with the exact word AGY_ACP_PONG and do not call any tools.",
             },
+            headers=self.bridge_headers,
         )
         self.assertEqual(disp.get("backend"), "agy")
         self.assertEqual(disp.get("model"), "gemini-3.8-flash-low")
         self.assertTrue(disp.get("threadId"))
 
         wait_until(
-            lambda: http_get_json(f"{self.bridge_url}/api/subagent/inspect?conversationId={conv_id}")["summary"]["status"] == "idle",
+            lambda: http_get_json(
+                f"{self.bridge_url}/api/subagent/inspect?conversationId={conv_id}",
+                headers=self.bridge_headers,
+            )["summary"]["status"] == "idle",
             timeout=40,
         )
-        insp = http_get_json(f"{self.bridge_url}/api/subagent/inspect?conversationId={conv_id}")
+        insp = http_get_json(
+            f"{self.bridge_url}/api/subagent/inspect?conversationId={conv_id}",
+            headers=self.bridge_headers,
+        )
         self.assertEqual(insp["summary"]["engine"], "agy")
         self.assertIn("AGY_ACP_PONG", insp["transcript"]["lastResponse"])
 
@@ -1324,6 +1436,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
         cfg = http_post_json(
             f"{self.bridge_url}/api/subagent/configure",
             {"conversationId": conv_id, "model": "claude-sonnet-5-5-low"},
+            headers=self.bridge_headers,
         )
         self.assertEqual(cfg.get("model"), "claude-sonnet-5-5-low")
         print(

@@ -127,8 +127,10 @@ class BackendRegistry:
         acp_command: Optional[Sequence[str]] = None,
         acp_env: Optional[Dict[str, str]] = None,
         acp_mode: Optional[str] = None,
+        auto_approve: bool = False,
     ) -> GenericAcpClient:
         if backend == "agy" and not acp_command:
+            self.agy.auto_approve = bool(auto_approve)
             return self.agy
         if not acp_command:
             raise ValueError(f"Backend {backend!r} requires a non-empty `acpCommand` (e.g. ['pi-acp'] or ['claude-code-acp'])")
@@ -142,10 +144,13 @@ class BackendRegistry:
                     list(cmd_tuple),
                     env=dict(env_tuple),
                     default_mode=acp_mode,
+                    auto_approve=auto_approve,
                     name=f"acp:{cmd_tuple[0]}",
                 )
                 client.add_notification_handler(self._on_acp_notification)
                 self._acp_clients[key] = client
+            else:
+                client.auto_approve = bool(auto_approve)
             return client
 
     def list_backends(self, *, codex_connected: bool = False) -> List[Dict[str, Any]]:

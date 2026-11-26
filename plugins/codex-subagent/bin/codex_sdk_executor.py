@@ -16,7 +16,7 @@ import urllib.request
 import uuid
 from typing import Any
 
-from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running
+from codex_bridge_daemon import BRIDGE_PORT, bridge_auth_headers, ensure_bridge_daemon_running
 from codex_hook_intercept import (
     acknowledge_messages, input_id, language_server_post, normalize_transcript_path, pending_messages, post_bridge_json,
 )
@@ -127,7 +127,8 @@ class SdkExecutor:
 
     def status(self) -> dict[str, Any]:
         query = urllib.parse.urlencode({key: self.registration[key] for key in ("conversationId", "sdkInstanceId")})
-        with urllib.request.urlopen(f"{self.base}/api/subagent/sdk-status?{query}", timeout=1.0) as response:
+        req = urllib.request.Request(f"{self.base}/api/subagent/sdk-status?{query}", headers=bridge_auth_headers())
+        with urllib.request.urlopen(req, timeout=1.0) as response:
             return json.load(response)
 
     def poll(self) -> None:

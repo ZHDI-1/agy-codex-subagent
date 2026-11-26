@@ -42,6 +42,7 @@ class GenericAcpClient:
         env: Optional[Dict[str, str]] = None,
         auto_start: bool = True,
         default_mode: Optional[str] = "auto",
+        auto_approve: bool = False,
         name: str = "acp",
         system_prompt_meta_builder: Optional[Callable[[str], Dict[str, Any]]] = None,
     ) -> None:
@@ -51,6 +52,7 @@ class GenericAcpClient:
         self.env_overrides: Dict[str, str] = dict(env or {})
         self.auto_start = auto_start
         self.default_mode = default_mode
+        self.auto_approve = auto_approve
         self.name = name
         self._system_prompt_meta_builder = system_prompt_meta_builder
 
@@ -168,6 +170,10 @@ class GenericAcpClient:
                 proc.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
 
     def _next_request_id(self) -> int:
         with self._id_lock:
@@ -243,12 +249,22 @@ class GenericAcpClient:
             except Exception:
                 logger.exception("Error in ACP callback")
 
+    def flush_callbacks(self, timeout: float = 5.0) -> bool:
+        """Waits until all notifications queued before this barrier have been delivered."""
+        worker = self._callback_worker
+        if worker is None or not worker.is_alive():
+            return True
+        done = threading.Event()
+        self._callbacks.put((done.set, ()))
+        return done.wait(timeout=timeout)
+
     def _deliver_notification(self, proc: subprocess.Popen, method: str, params: Dict[str, Any]) -> None:
         if proc is not self._proc and method != "acp/disconnected":
             return
+        enriched = {**params, "_acpClientId": id(self)} if isinstance(params, dict) else params
         for handler in list(self._notification_handlers):
             try:
-                handler(method, params)
+                handler(method, enriched)
             except Exception:
                 logger.exception("Error in ACP notification handler for %s", method)
 
@@ -256,15 +272,22 @@ class GenericAcpClient:
         if method == "session/request_permission":
             options = params.get("options") or []
             chosen_id = None
-            for kind in ("allow_always", "allow_once"):
-                for opt in options:
-                    if isinstance(opt, dict) and opt.get("kind") == kind:
-                        chosen_id = opt.get("optionId")
+            if self.auto_approve:
+                for kind in ("allow_always", "allow_once"):
+                    for opt in options:
+                        if isinstance(opt, dict) and opt.get("kind") == kind:
+                            chosen_id = opt.get("optionId")
+                            break
+                    if chosen_id:
                         break
-                if chosen_id:
-                    break
-            if not chosen_id and options and isinstance(options[0], dict):
-                chosen_id = options[0].get("optionId")
+            else:
+                for kind in ("reject_once", "reject_always"):
+                    for opt in options:
+                        if isinstance(opt, dict) and opt.get("kind") == kind:
+                            chosen_id = opt.get("optionId")
+                            break
+                    if chosen_id:
+                        break
             result: Dict[str, Any] = (
                 {"outcome": {"outcome": "selected", "optionId": chosen_id}}
                 if chosen_id
@@ -410,11 +433,13 @@ class GenericAcpClient:
         self.notify("session/cancel", {"sessionId": session_id})
 
     def session_resume(self, session_id: str, cwd: Optional[str] = None) -> Dict[str, Any]:
-        return self.request(
-            "session/resume",
-            {"sessionId": session_id, "cwd": cwd or os.getcwd(), "mcpServers": []},
-            timeout=20.0,
-        )
+        payload = {"sessionId": session_id, "cwd": cwd or os.getcwd(), "mcpServers": []}
+        try:
+            return self.request("session/resume", payload, timeout=20.0)
+        except AcpRpcError as e:
+            if e.code == -32601 or "not supported" in e.message.lower():
+                return self.request("session/load", payload, timeout=20.0)
+            raise
 
     def session_list(self, cwd: Optional[str] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {}

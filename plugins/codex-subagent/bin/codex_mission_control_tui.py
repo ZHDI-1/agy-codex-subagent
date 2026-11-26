@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import curses
 import json
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -23,11 +24,12 @@ from typing import Any, Dict, List, Optional, Tuple
 BIN_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BIN_DIR))
 
-from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running
+from codex_bridge_daemon import BRIDGE_PORT, bridge_auth_headers, ensure_bridge_daemon_running
 
 
 def fetch_json(url: str, timeout: float = 2.0) -> Dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    req = urllib.request.Request(url, headers=bridge_auth_headers())
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
@@ -35,7 +37,7 @@ def post_json(url: str, payload: Dict[str, Any], timeout: float = 10.0) -> Dict[
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=bridge_auth_headers({"Content-Type": "application/json"}),
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -580,10 +582,10 @@ def spawn_tmux_split(script_path: Path, target_pane: Optional[str], width_pct: i
     cmd = ["tmux", "split-window", "-h", "-d", "-p", str(width_pct)]
     if target_pane:
         cmd.extend(["-t", target_pane])
-    py_cmd = f"{sys.executable} {script_path}"
+    py_args = [sys.executable, str(script_path)]
     if show_all:
-        py_cmd += " --all"
-    cmd.append(py_cmd)
+        py_args.append("--all")
+    cmd.append(shlex.join(py_args))
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         sys.stderr.write(f"tmux split-window failed: {res.stderr}\n")

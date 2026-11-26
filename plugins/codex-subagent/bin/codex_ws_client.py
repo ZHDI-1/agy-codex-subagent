@@ -669,16 +669,16 @@ class CodexAppServerClient:
         )
 
     @staticmethod
-    def sandbox_mode_to_policy(sandbox_mode: str, cwd: Optional[str] = None) -> Dict[str, Any]:
+    def sandbox_mode_to_policy(sandbox_mode: str, cwd: Optional[str] = None, network_access: bool = False) -> Dict[str, Any]:
         if sandbox_mode == "danger-full-access":
             return {"type": "dangerFullAccess"}
         if sandbox_mode == "read-only":
-            return {"type": "readOnly", "networkAccess": True}
+            return {"type": "readOnly", "networkAccess": bool(network_access)}
         roots = [cwd] if cwd and os.path.isabs(cwd) else []
         return {
             "type": "workspaceWrite",
             "writableRoots": roots,
-            "networkAccess": True,
+            "networkAccess": bool(network_access),
             "excludeTmpdirEnvVar": False,
             "excludeSlashTmp": False,
         }

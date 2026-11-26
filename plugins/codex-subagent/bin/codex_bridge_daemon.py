@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -113,6 +114,36 @@ def primary_app_data_dir() -> Path:
     return find_app_data_dirs()[0]
 
 
+def get_bridge_token() -> str:
+    """Returns a user-private secret token (mode 0600) authenticating local bridge HTTP requests."""
+    env_tok = os.environ.get("AGY_CODEX_BRIDGE_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+    token_path = primary_app_data_dir() / "codex_bridge_token"
+    try:
+        if token_path.is_file():
+            existing = token_path.read_text(encoding="utf-8").strip()
+            if len(existing) >= 16:
+                return existing
+    except OSError:
+        pass
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    tok = secrets.token_hex(24)
+    fd = os.open(str(token_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (tok + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    return tok
+
+
+def bridge_auth_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = {"X-Bridge-Token": get_bridge_token()}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def unquote_arg(v: Any) -> str:
     if v is None:
         return ""
@@ -172,8 +203,12 @@ def summarize_transcript_file(transcript_path: Path, max_steps: int = 40) -> Dic
             continue
         if not isinstance(step, dict):
             continue
-        s_idx = step.get("step_index", len(recent_steps))
-        if isinstance(s_idx, int) and s_idx + 1 > total_steps:
+        raw_idx = step.get("step_index", len(recent_steps))
+        try:
+            s_idx = int(raw_idx) if not isinstance(raw_idx, bool) else len(recent_steps)
+        except (ValueError, TypeError):
+            s_idx = len(recent_steps)
+        if s_idx + 1 > total_steps:
             total_steps = s_idx + 1
         s_type = str(step.get("type", ""))
         s_status = str(step.get("status", ""))
@@ -304,7 +339,9 @@ class UnifiedSubagentBridge:
         self.lock = threading.RLock()
         self.turn_changed = threading.Condition(self.lock)
         self._conversation_locks: Dict[str, threading.RLock] = {}
+        self._thread_locks: Dict[str, threading.RLock] = {}
         self._thread_connections: Dict[str, Any] = {}
+        self._conv_by_acp_key: Dict[tuple, str] = {}
         self._approval_replies: Dict[str, Callable[..., None]] = {}
 
         # Language Server credentials (updated dynamically from env / hooks / sidecar)
@@ -389,8 +426,14 @@ class UnifiedSubagentBridge:
 
     def list_profiles(self) -> Dict[str, Any]:
         with self.lock:
+            redacted = []
+            for name in sorted(self.profiles):
+                prof = dict(self.profiles[name])
+                if isinstance(prof.get("acpEnv"), dict):
+                    prof["acpEnv"] = {k: "***" for k in prof["acpEnv"]}
+                redacted.append(prof)
             return {
-                "profiles": [dict(self.profiles[name]) for name in sorted(self.profiles)],
+                "profiles": redacted,
                 "defaults": load_config(),
                 "codexConfigToml": read_codex_config_toml(),
             }
@@ -435,6 +478,10 @@ class UnifiedSubagentBridge:
         self._validate_conversation_id(conversation_id)
         with self.lock:
             return self._conversation_locks.setdefault(conversation_id, threading.RLock())
+
+    def _thread_lock(self, thread_id: str) -> threading.RLock:
+        with self.lock:
+            return self._thread_locks.setdefault(thread_id, threading.RLock())
 
     def _new_session(self, conversation_id: str, agent_name: str, backend_override: Optional[str] = None) -> Dict[str, Any]:
         settings = load_config()
@@ -852,13 +899,21 @@ class UnifiedSubagentBridge:
                     result = self._dispatch_pi_input(session, clean_text, additional_context)
                 else:
                     directive = PREFIX_CMD_RE.match(clean_text)
+                    used_pending_prompt = False
                     if directive and directive[1].upper() == "FORCE":
                         bypass_quota_check = True
                         forced_body = directive[2].strip()
                         with self.lock:
-                            pending_prompt = session.pop("pendingQuotaPrompt", "")
-                        clean_text = forced_body or pending_prompt
-                        if not clean_text:
+                            pending_prompt = session.get("pendingQuotaPrompt", "")
+                            pending_ctx = session.get("pendingQuotaContext")
+                        if forced_body:
+                            clean_text = forced_body
+                        elif pending_prompt:
+                            clean_text = pending_prompt
+                            used_pending_prompt = True
+                            if additional_context is None and pending_ctx:
+                                additional_context = pending_ctx
+                        else:
                             return {"action": "no_input", "conversationId": conversation_id}
                         directive = PREFIX_CMD_RE.match(clean_text)
 
@@ -873,16 +928,23 @@ class UnifiedSubagentBridge:
                         )
                     else:
                         is_new_thread = not bool(session.get("threadId"))
-                        if is_new_thread and not bypass_quota_check and not directive:
+                        skip_quota_directives = ("APPROVE", "DECLINE")
+                        d_name = directive[1].upper() if directive else ""
+                        if is_new_thread and not bypass_quota_check and d_name not in skip_quota_directives:
                             quota = self.get_codex_quota()
                             if quota.get("belowThreshold"):
-                                result = self._handle_quota_blocked(session, clean_text, quota)
+                                result = self._handle_quota_blocked(session, clean_text, quota, additional_context)
                                 return result
                         self._ensure_thread(session)
                         if directive:
                             result = self._execute_directive(session, directive[1].upper(), directive[2].strip())
                         else:
                             result = self._dispatch_turn(session, clean_text, additional_context)
+                        if used_pending_prompt:
+                            with self.lock:
+                                session.pop("pendingQuotaPrompt", None)
+                                session.pop("pendingQuotaContext", None)
+                                self._save_state()
             except Exception as e:
                 with self.lock:
                     if session["status"] == "starting" or not session.get("threadId"):
@@ -920,11 +982,16 @@ class UnifiedSubagentBridge:
         return self.list_backend_models("agy")
 
     def _acp_client_for(self, session: Dict[str, Any]) -> GenericAcpClient:
+        auto_approve = (
+            session.get("permissionSource") == "bypass"
+            or session.get("approvalPolicy") == "never"
+        )
         return self.backends.get_acp_client(
             session.get("backend", "agy"),
             acp_command=session.get("acpCommand"),
             acp_env=session.get("acpEnv"),
             acp_mode=session.get("acpMode"),
+            auto_approve=auto_approve,
         )
 
     def _ensure_agy_session(self, session: Dict[str, Any]) -> str:
@@ -971,6 +1038,7 @@ class UnifiedSubagentBridge:
             if res.get("selectedModelId"):
                 session["model"] = res["selectedModelId"]
             self.conv_by_thread[sid] = session["conversationId"]
+            self._conv_by_acp_key[(id(client), sid)] = session["conversationId"]
             self._agy_connections[sid] = connection
             self._save_state()
         return sid
@@ -998,7 +1066,11 @@ class UnifiedSubagentBridge:
                     self._acp_client_for(session).session_cancel(sid)
                     self._record_event(session, "session/cancel", {"turnId": active})
                     with self.turn_changed:
-                        self.turn_changed.wait_for(lambda: session.get("activeTurnId") != active, timeout=10.0)
+                        finished = self.turn_changed.wait_for(
+                            lambda: session.get("activeTurnId") != active, timeout=10.0
+                        )
+                    if not finished and remainder:
+                        raise TimeoutError(f"ACP turn {active} did not acknowledge cancellation in time")
                 if remainder:
                     return self._start_agy_turn(session, remainder, additional_context)
                 return {
@@ -1042,7 +1114,9 @@ class UnifiedSubagentBridge:
                 session["status"] = "interrupting"
             self._acp_client_for(session).session_cancel(sid)
             with self.turn_changed:
-                self.turn_changed.wait_for(lambda: session.get("activeTurnId") != active, timeout=10.0)
+                finished = self.turn_changed.wait_for(lambda: session.get("activeTurnId") != active, timeout=10.0)
+            if not finished:
+                raise TimeoutError(f"ACP turn {active} did not acknowledge cancellation before steering")
             steered_text = f"[LIVE STEER OVERRIDE]: {clean_text}"
             res = self._start_agy_turn(session, steered_text, additional_context)
             res["action"] = "acp/steer"
@@ -1108,8 +1182,9 @@ class UnifiedSubagentBridge:
         result_status = "completed"
         usage: Dict[str, Any] = {}
         error_obj: Any = None
+        client = self._acp_client_for(session)
         try:
-            res = self._acp_client_for(session).session_prompt(sid, prompt_text, timeout=3600.0)
+            res = client.session_prompt(sid, prompt_text, timeout=3600.0)
             stop_reason = (res or {}).get("stopReason", "end_turn")
             usage = (res or {}).get("usage") or {}
             if stop_reason == "cancelled":
@@ -1118,6 +1193,8 @@ class UnifiedSubagentBridge:
             result_status = "failed"
             error_obj = str(e)
             logger.warning("ACP turn %s on session %s failed: %s", turn_id, sid, e)
+        if hasattr(client, "flush_callbacks"):
+            client.flush_callbacks(timeout=5.0)
         self._on_agy_turn_completed(session, turn_id, result_status, usage, error_obj)
 
     def _on_agy_notification(self, method: str, params: Dict[str, Any]) -> None:
@@ -1141,7 +1218,12 @@ class UnifiedSubagentBridge:
         utype = update.get("sessionUpdate", "")
 
         with self.lock:
-            cid = self.conv_by_thread.get(sid) if sid else None
+            acp_client_id = params.get("_acpClientId")
+            cid = (
+                self._conv_by_acp_key.get((acp_client_id, sid))
+                if (acp_client_id and sid)
+                else None
+            ) or (self.conv_by_thread.get(sid) if sid else None)
             session = self.sessions_by_conv.get(cid) if cid else None
             if not session or session.get("status") == "killed":
                 return
@@ -1223,6 +1305,13 @@ class UnifiedSubagentBridge:
         error: Any,
     ) -> None:
         with self.lock:
+            if session.get("status") == "killed":
+                return
+            active = session.get("activeTurnId")
+            if active and active != turn_id:
+                return
+            if not active and session.get("lastTerminalTurnId") == turn_id:
+                return
             conv_id = session["conversationId"]
             sid = session.get("threadId") or ""
             message = session.get("lastAgentMessage", "").strip()
@@ -1294,7 +1383,16 @@ class UnifiedSubagentBridge:
             ).start()
 
         if next_prompt:
-            self._start_agy_turn(session, next_prompt)
+            def _drain_next() -> None:
+                try:
+                    with self._conversation_lock(conv_id):
+                        with self.lock:
+                            if session.get("status") == "killed" or session.get("activeTurnId"):
+                                return
+                        self._start_agy_turn(session, next_prompt)
+                except Exception:
+                    logger.exception("Failed starting queued ACP prompt for %s", conv_id)
+            threading.Thread(target=_drain_next, name=f"acp-queue-{conv_id[:10]}", daemon=True).start()
 
     # -------------------------------------------------------------------------
     # Pi Coding Agent (`pi --mode rpc`) Native Execution & Streaming
@@ -1302,7 +1400,7 @@ class UnifiedSubagentBridge:
 
     def _ensure_pi_session(self, session: Dict[str, Any]) -> Any:
         cid = session["conversationId"]
-        sid = session.get("threadId") or f"pi-{cid[:24]}"
+        sid = session.get("threadId") or f"pi-{cid}"
         proc = self.backends.pi.get_or_create(
             sid,
             cwd=session.get("cwd") or os.getcwd(),
@@ -1391,7 +1489,21 @@ class UnifiedSubagentBridge:
             self._record_event(session, "pi/prompt", {"turnId": turn_id, "prompt": clean_text[:200]})
             self._save_state()
 
-        proc.command("prompt", {"message": full_text}, timeout=20.0)
+        try:
+            proc.command("prompt", {"message": full_text}, timeout=20.0)
+        except Exception as e:
+            with self.lock:
+                if session.get("activeTurnId") == turn_id:
+                    session.update(
+                        activeTurnId=None,
+                        status="error",
+                        currentActivity=f"Pi prompt failed: {e}",
+                        activityKind="",
+                    )
+                    self._sync_sqlite_status(cid, "CASCADE_RUN_STATUS_IDLE", session["stepCount"], str(e)[:160], 0)
+                    self._save_state()
+                    self.turn_changed.notify_all()
+            raise
         return {
             "action": "turn/start",
             "backend": "pi",
@@ -1460,11 +1572,18 @@ class UnifiedSubagentBridge:
                 })
                 return
 
-            if etype == "agent_end":
-                turn_id = session.get("activeTurnId") or f"pi-turn-{uuid.uuid4().hex[:8]}"
-                # Release lock via helper
-        if etype == "agent_end":
-            self._on_agy_turn_completed(session, turn_id, "completed", {}, None)
+            if etype in ("agent_settled", "agent_end"):
+                if etype == "agent_end" and event.get("willContinue"):
+                    return
+                turn_id = session.get("activeTurnId")
+                if not turn_id:
+                    return
+                pi_result = "interrupted" if session.get("status") == "interrupting" else (
+                    "failed" if event.get("error") else "completed"
+                )
+                pi_err = event.get("error")
+        if etype in ("agent_settled", "agent_end"):
+            self._on_agy_turn_completed(session, turn_id, pi_result, {}, pi_err)
 
     def _ensure_thread(self, session: Dict[str, Any]) -> None:
         self.codex.connect()
@@ -2219,6 +2338,7 @@ class UnifiedSubagentBridge:
         self,
         root_conversation_id: Optional[str] = None,
         include_all: bool = True,
+        include_quota: bool = True,
     ) -> Dict[str, Any]:
         """
         Builds a unified roster of:
@@ -2389,7 +2509,7 @@ class UnifiedSubagentBridge:
             "codexDaemonConnected": self.codex.is_connected(),
             "codexUserAgent": self.codex.user_agent,
             "lsAddress": self.ls_address,
-            "codexQuota": self.get_codex_quota(use_cache=True),
+            "codexQuota": self.get_codex_quota(use_cache=True) if include_quota else None,
             "subagents": subagents,
         }
 
@@ -2399,7 +2519,7 @@ class UnifiedSubagentBridge:
         Returns transcript steps, live thinking, tool calls, unified file diffs, and plan checklist.
         """
         self._validate_conversation_id(conversation_id)
-        roster = self.list_unified_subagents(include_all=True)
+        roster = self.list_unified_subagents(include_all=True, include_quota=False)
         summary = next(
             (s for s in roster["subagents"] if s["conversationId"] == conversation_id),
             None,
@@ -2618,8 +2738,11 @@ class UnifiedSubagentBridge:
         with self.lock:
             codex_sess = self.sessions_by_conv.get(conversation_id)
 
-        if codex_sess and codex_sess.get("threadId"):
-            return self.dispatch_subagent_input(conversation_id, f"[REVERT:{max(1, step_or_turns)}]")
+        if codex_sess:
+            if codex_sess.get("backend", "codex") != "codex":
+                raise ValueError(f"Revert is not supported for backend {codex_sess.get('backend')!r}")
+            if codex_sess.get("threadId"):
+                return self.dispatch_subagent_input(conversation_id, f"[REVERT:{max(1, step_or_turns)}]")
 
         res = self.lsrpc(
             "RevertToCascadeStep",
@@ -2646,6 +2769,9 @@ class UnifiedSubagentBridge:
         with self.lock:
             codex_sess = self.sessions_by_conv.get(conversation_id)
 
+        if codex_sess:
+            if codex_sess.get("backend", "codex") != "codex":
+                raise ValueError(f"Fork is not supported for backend {codex_sess.get('backend')!r}")
         if codex_sess and codex_sess.get("threadId"):
             with self._conversation_lock(conversation_id):
                 self._ensure_thread(codex_sess)
@@ -2723,6 +2849,14 @@ class UnifiedSubagentBridge:
                 user_input=handoff_context,
                 backend=target_engine,
             )
+            if res.get("action") == "quota_blocked":
+                return {
+                    "action": "quota_blocked",
+                    "sourceConversationId": source_conversation_id,
+                    "newConversationId": new_conv_id,
+                    "quota": res.get("quota"),
+                    "message": res.get("message"),
+                }
             return {
                 "action": f"handoff_to_{target_engine}",
                 "sourceConversationId": source_conversation_id,
@@ -2784,20 +2918,24 @@ class UnifiedSubagentBridge:
         threshold = self._resolve_quota_threshold(threshold_percent)
         now = time.monotonic()
         cached = getattr(self, "_quota_cache", None)
-        if use_cache and cached and (now - cached[0] < 15.0) and cached[1].get("thresholdPercent") == threshold:
-            return dict(cached[1])
+        if use_cache and cached and cached[1].get("thresholdPercent") == threshold:
+            ttl = 15.0 if cached[1].get("available") else 5.0
+            if now - cached[0] < ttl:
+                return dict(cached[1])
 
         try:
             raw = self.codex.account_rate_limits_read()
         except Exception as e:
             logger.debug("account/rateLimits/read failed: %s", e)
-            return {
+            err_res = {
                 "available": False,
                 "belowThreshold": False,
                 "thresholdPercent": threshold,
                 "error": str(e),
                 "summary": f"Codex quota check unavailable: {e}",
             }
+            self._quota_cache = (now, err_res)
+            return dict(err_res)
 
         if not isinstance(raw, dict) or not raw.get("rateLimits"):
             return {
@@ -2898,6 +3036,7 @@ class UnifiedSubagentBridge:
         session: Dict[str, Any],
         prompt_text: str,
         quota: Dict[str, Any],
+        additional_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Cancels launching a new Codex thread when quota is below threshold and notifies the parent."""
         conv_id = session["conversationId"]
@@ -2928,6 +3067,7 @@ class UnifiedSubagentBridge:
                 currentActivity=quota.get("summary", "Quota below threshold"),
                 activityKind="warning",
                 pendingQuotaPrompt=prompt_text,
+                pendingQuotaContext=additional_context,
                 quotaCheck=quota,
                 updatedAt=utc_now_iso(),
             )
@@ -3170,9 +3310,10 @@ class UnifiedSubagentBridge:
                 if combined_msg:
                     session["lastAgentMessage"] = combined_msg
                 if turn_status in ("inProgress", "running", "working", "active"):
-                    session["activeTurnId"] = turn_id
-                    session["status"] = "working"
-                    session["currentActivity"] = "Adopted active turn in progress..."
+                    if session.get("lastTerminalTurnId") != turn_id:
+                        session["activeTurnId"] = turn_id
+                        session["status"] = "working"
+                        session["currentActivity"] = "Adopted active turn in progress..."
                 else:
                     session.setdefault("turnHistory", []).append({
                         "turnId": turn_id,
@@ -3221,7 +3362,7 @@ class UnifiedSubagentBridge:
             )
         self._validate_conversation_id(target_cid)
 
-        with self._conversation_lock(target_cid):
+        with self._thread_lock(clean_tid), self._conversation_lock(target_cid):
             try:
                 resumed = self.codex.thread_resume(clean_tid, cwd=cwd)
             except CodexRpcError as e:
@@ -3239,12 +3380,32 @@ class UnifiedSubagentBridge:
             status_obj = thread_obj.get("status")
             raw_status = status_obj.get("type", "idle") if isinstance(status_obj, dict) else "idle"
 
-            perm_src = permission_source or cfg.get("permissionSource", "codexConfig")
-            perm_src, eff_ap, eff_sb = resolve_effective_permissions(
-                perm_src,
-                approval_policy or cfg.get("approvalPolicy", "inherit"),
-                sandbox_mode or cfg.get("sandboxMode", "inherit"),
+            explicit_perm_change = any(
+                x not in (None, "") for x in (permission_source, approval_policy, sandbox_mode)
             )
+            if explicit_perm_change:
+                perm_src = permission_source or cfg.get("permissionSource", "codexConfig")
+                perm_src, eff_ap, eff_sb = resolve_effective_permissions(
+                    perm_src,
+                    approval_policy or cfg.get("approvalPolicy", "inherit"),
+                    sandbox_mode or cfg.get("sandboxMode", "inherit"),
+                )
+            else:
+                perm_src = "threadDefault"
+                eff_ap = str(resumed.get("approvalPolicy") or cfg.get("approvalPolicy") or "on-request")
+                sb_raw = resumed.get("sandbox")
+                eff_sb = str(sb_raw.get("type") if isinstance(sb_raw, dict) else (sb_raw or "workspace-write"))
+
+            # Apply permission/model/effort settings BEFORE committing state if explicitly requested
+            if explicit_perm_change or model or effort:
+                self.codex.thread_settings_update(
+                    thread_id=clean_tid,
+                    model=model,
+                    effort=effort,
+                    approval_policy=eff_ap if explicit_perm_change else None,
+                    sandbox_mode=eff_sb if explicit_perm_change else None,
+                    cwd=live_cwd,
+                )
 
             with self.lock:
                 if existing_cid and existing_cid != target_cid:
@@ -3284,20 +3445,6 @@ class UnifiedSubagentBridge:
                     session["parentConversationId"] = parent_conversation_id
                 self.conv_by_thread[clean_tid] = target_cid
                 self._thread_connections[clean_tid] = connection
-
-            # Apply permission/model/effort settings onto the adopted thread if supported
-            if permission_source or approval_policy or sandbox_mode or model or effort:
-                try:
-                    self.codex.thread_settings_update(
-                        thread_id=clean_tid,
-                        model=model,
-                        effort=effort,
-                        approval_policy=eff_ap,
-                        sandbox_mode=eff_sb,
-                        cwd=live_cwd,
-                    )
-                except CodexRpcError as e:
-                    logger.debug("thread_settings_update during adopt skipped: %s", e)
 
             hydrated_turns = self._hydrate_adopted_thread_turns(session, clean_tid)
             self._record_event(session, "thread/adopted", {
@@ -3431,25 +3578,22 @@ class UnifiedSubagentBridge:
                         self._record_event(session, "pi/set_thinking_level", {"effort": effort})
                 return result
             if tid and (perm_changed or model is not None or effort is not None):
-                try:
-                    self._ensure_thread(session)
-                    result["threadSettingsUpdate"] = self.codex.thread_settings_update(
-                        thread_id=tid,
-                        model=model,
-                        effort=effort,
-                        approval_policy=eff_ap if perm_changed else None,
-                        sandbox_mode=eff_sb if perm_changed else None,
-                        cwd=session.get("cwd"),
-                    )
-                    self._record_event(session, "thread/settings/update", {
-                        "permissionSource": session.get("permissionSource"),
-                        "approvalPolicy": eff_ap,
-                        "sandboxMode": eff_sb,
-                        "model": session.get("model"),
-                        "effort": session.get("effort"),
-                    })
-                except CodexRpcError as e:
-                    logger.debug("thread_settings_update returned: %s", e)
+                self._ensure_thread(session)
+                result["threadSettingsUpdate"] = self.codex.thread_settings_update(
+                    thread_id=tid,
+                    model=model,
+                    effort=effort,
+                    approval_policy=eff_ap if perm_changed else None,
+                    sandbox_mode=eff_sb if perm_changed else None,
+                    cwd=session.get("cwd"),
+                )
+                self._record_event(session, "thread/settings/update", {
+                    "permissionSource": session.get("permissionSource"),
+                    "approvalPolicy": eff_ap,
+                    "sandboxMode": eff_sb,
+                    "model": session.get("model"),
+                    "effort": session.get("effort"),
+                })
             if tid and turn_id and (model is not None or effort is not None):
                 try:
                     result["settingsUpdate"] = self.codex.turn_settings_update(tid, turn_id, model, effort)
@@ -3499,6 +3643,11 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
     def local_host(self) -> bool:
         return self.headers.get("Host", "").split(":", 1)[0] in ("127.0.0.1", "localhost")
 
+    def authorized(self) -> bool:
+        expected = get_bridge_token()
+        provided = (self.headers.get("X-Bridge-Token") or "").strip()
+        return bool(provided) and secrets.compare_digest(provided, expected)
+
     def do_GET(self) -> None:
         assert BRIDGE_INSTANCE is not None
         if not self.local_host():
@@ -3506,6 +3655,9 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
+        if parsed.path not in ("/api/ready", "/api/health") and not self.authorized():
+            self._send_json(401, {"error": "Missing or invalid X-Bridge-Token"})
+            return
 
         try:
             if parsed.path == "/api/ready":
@@ -3596,6 +3748,9 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
         if not self.local_host() or self.headers.get("Origin") or self.headers.get_content_type() != "application/json":
             self._send_json(403, {"error": "Use a local client or the Mission Control sidecar"})
             return
+        if not self.authorized():
+            self._send_json(401, {"error": "Missing or invalid X-Bridge-Token"})
+            return
         try:
             body = self._read_json_body()
 
@@ -3647,8 +3802,6 @@ class BridgeHttpHandler(BaseHTTPRequestHandler):
                     input_id=body.get("inputId"),
                     bypass_quota_check=bool(body.get("bypassQuotaCheck", False)),
                     backend=body.get("backend"),
-                    acp_command=body.get("acpCommand"),
-                    acp_env=body.get("acpEnv"),
                     acp_mode=body.get("acpMode"),
                     provider=body.get("provider"),
                 )
@@ -3800,6 +3953,7 @@ def main() -> None:
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, signal.default_int_handler)
+    get_bridge_token()
     with ThreadingHTTPServer((args.host, args.port), BridgeHttpHandler) as server:
         BRIDGE_INSTANCE = UnifiedSubagentBridge()
         logger.info("Unified Subagent Bridge Daemon listening on http://%s:%d", args.host, args.port)

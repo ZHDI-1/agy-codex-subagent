@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("pi_rpc_client")
 
@@ -56,9 +56,10 @@ class PiSessionProcess:
         self._on_event = on_event
 
         self._proc: Optional[subprocess.Popen] = None
+        self._generation = 0
         self._lock = threading.RLock()
         self._write_lock = threading.Lock()
-        self._pending: Dict[str, queue.Queue] = {}
+        self._pending: Dict[str, Tuple[subprocess.Popen, queue.Queue]] = {}
         self._pending_lock = threading.Lock()
 
     def is_running(self) -> bool:
@@ -92,9 +93,11 @@ class PiSessionProcess:
                 start_new_session=True,
             )
             self._proc = proc
+            self._generation += 1
+            gen = self._generation
             threading.Thread(
                 target=self._reader_loop,
-                args=(proc,),
+                args=(proc, gen),
                 name=f"pi-rpc-reader-{self.session_key[:10]}",
                 daemon=True,
             ).start()
@@ -114,6 +117,10 @@ class PiSessionProcess:
                         proc.wait(timeout=3.0)
                     except subprocess.TimeoutExpired:
                         proc.kill()
+                        try:
+                            proc.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
+                            pass
 
     def command(self, cmd_type: str, payload: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> Dict[str, Any]:
         self.start()
@@ -123,7 +130,7 @@ class PiSessionProcess:
         req_id = f"pi-{uuid.uuid4().hex[:10]}"
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
-            self._pending[req_id] = q
+            self._pending[req_id] = (proc, q)
         msg = {"id": req_id, "type": cmd_type, **(payload or {})}
         try:
             with self._write_lock:
@@ -141,7 +148,7 @@ class PiSessionProcess:
             raise PiRpcError(str(resp.get("error") or f"Pi RPC '{cmd_type}' failed"))
         return resp.get("data") if isinstance(resp.get("data"), dict) else resp
 
-    def _reader_loop(self, proc: subprocess.Popen) -> None:
+    def _reader_loop(self, proc: subprocess.Popen, generation: int) -> None:
         try:
             assert proc.stdout is not None
             for raw in proc.stdout:
@@ -157,33 +164,44 @@ class PiSessionProcess:
                 mtype = msg.get("type", "")
                 if mtype == "response" and msg.get("id"):
                     with self._pending_lock:
-                        q = self._pending.get(str(msg["id"]))
-                    if q is not None:
+                        entry = self._pending.get(str(msg["id"]))
+                    if entry is not None and entry[0] is proc:
                         try:
-                            q.put_nowait(msg)
+                            entry[1].put_nowait(msg)
                         except queue.Full:
                             pass
                 elif mtype == "extension_ui_request":
-                    # Ignore decorative TUI status/widget requests in headless RPC mode
+                    # Reply with cancellation for interactive dialogs that expect a response
+                    if msg.get("id") and msg.get("method") in ("select", "confirm", "input", "editor"):
+                        try:
+                            with self._write_lock:
+                                if proc.stdin and not proc.stdin.closed:
+                                    proc.stdin.write(json.dumps({
+                                        "type": "extension_ui_response", "id": msg["id"], "cancelled": True,
+                                    }) + "\n")
+                                    proc.stdin.flush()
+                        except OSError:
+                            pass
                     continue
-                elif self._on_event:
+                elif self._on_event and proc is self._proc:
                     try:
-                        self._on_event(self.session_key, msg)
+                        self._on_event(self.session_key, {**msg, "_piGeneration": generation})
                     except Exception:
                         logger.exception("Error in Pi RPC event handler")
         except Exception as e:
             logger.debug("Pi RPC reader exited: %s", e)
         finally:
             with self._pending_lock:
-                for rid, q in list(self._pending.items()):
-                    self._pending.pop(rid, None)
-                    try:
-                        q.put_nowait(ConnectionError("Pi RPC process disconnected"))
-                    except queue.Full:
-                        pass
-            if self._on_event:
+                for rid, (owner, q) in list(self._pending.items()):
+                    if owner is proc:
+                        self._pending.pop(rid, None)
+                        try:
+                            q.put_nowait(ConnectionError("Pi RPC process disconnected"))
+                        except queue.Full:
+                            pass
+            if self._on_event and proc is self._proc:
                 try:
-                    self._on_event(self.session_key, {"type": "pi/disconnected"})
+                    self._on_event(self.session_key, {"type": "pi/disconnected", "_piGeneration": generation})
                 except Exception:
                     pass
 

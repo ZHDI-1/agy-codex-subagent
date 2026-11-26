@@ -15,7 +15,13 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from codex_bridge_daemon import BRIDGE_HOST, BRIDGE_PORT, ensure_bridge_daemon_running, find_app_data_dirs
+from codex_bridge_daemon import (
+    BRIDGE_HOST,
+    BRIDGE_PORT,
+    bridge_auth_headers,
+    ensure_bridge_daemon_running,
+    find_app_data_dirs,
+)
 from codex_profiles import active_sdk_definition, live_sdk_instance, load_config, load_profiles, read_object
 
 SYSTEM_MSG_RE = re.compile(
@@ -174,7 +180,7 @@ def get_route(payload: dict[str, Any], conversation: str) -> tuple[str, str, str
 def post_bridge_json(base_url: str, path: str, payload: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     req = urllib.request.Request(
         f"{base_url}{path}", data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"}, method="POST",
+        headers=bridge_auth_headers({"Content-Type": "application/json"}), method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read() or b"{}")
@@ -271,10 +277,6 @@ def main() -> None:
             }],
         }))
     except Exception as exc:
-        try:
-            acknowledge_messages(locals().get("markers") or [])
-        except Exception:
-            pass
         if address:
             try:
                 language_server_post(

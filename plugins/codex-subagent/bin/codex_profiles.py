@@ -38,8 +38,8 @@ def read_codex_config_toml(path: Path | None = None) -> dict[str, Any]:
     result = {
         "path": str(target),
         "exists": False,
-        "approvalPolicy": "never",
-        "sandboxMode": "danger-full-access",
+        "approvalPolicy": "on-request",
+        "sandboxMode": "workspace-write",
         "model": "",
         "effort": "",
     }
@@ -48,16 +48,18 @@ def read_codex_config_toml(path: Path | None = None) -> dict[str, Any]:
     try:
         raw = tomllib.loads(target.read_text(encoding="utf-8", errors="replace"))
         result["exists"] = True
-        ap = str(raw.get("approval_policy") or "never").strip()
-        sb = str(raw.get("sandbox_mode") or "danger-full-access").strip()
-        result["approvalPolicy"] = ap if ap in ("never", "on-request", "untrusted") else "never"
-        result["sandboxMode"] = sb if sb in ("read-only", "workspace-write", "danger-full-access") else "danger-full-access"
+        ap = str(raw.get("approval_policy") or "").strip()
+        sb = str(raw.get("sandbox_mode") or "").strip()
+        if ap in ("never", "on-request", "untrusted"):
+            result["approvalPolicy"] = ap
+        if sb in ("read-only", "workspace-write", "danger-full-access"):
+            result["sandboxMode"] = sb
         if isinstance(raw.get("model"), str):
             result["model"] = raw["model"].strip()
         if isinstance(raw.get("model_reasoning_effort"), str):
             result["effort"] = raw["model_reasoning_effort"].strip()
     except Exception as e:
-        logging.getLogger(__name__).warning("Failed reading %s: %s", target, e)
+        logging.getLogger(__name__).warning("Failed reading %s (failing closed to on-request/workspace-write): %s", target, e)
     return result
 
 

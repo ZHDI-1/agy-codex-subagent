@@ -25,7 +25,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from codex_profiles import APPROVAL_POLICIES, BACKENDS, EFFORTS, EXECUTION_MODES, PERMISSION_SOURCES, SANDBOX_MODES
-from codex_bridge_daemon import BRIDGE_PORT, ensure_bridge_daemon_running
+from codex_bridge_daemon import BRIDGE_PORT, bridge_auth_headers, ensure_bridge_daemon_running
 
 
 def bridge_get(path: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -35,7 +35,8 @@ def bridge_get(path: str, params: Optional[Dict[str, str]] = None) -> Dict[str, 
         qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
         if qs:
             url = f"{url}?{qs}"
-    with urllib.request.urlopen(url, timeout=20.0) as resp:
+    req = urllib.request.Request(url, headers=bridge_auth_headers())
+    with urllib.request.urlopen(req, timeout=20.0) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
@@ -51,7 +52,7 @@ def bridge_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     req = urllib.request.Request(
         f"{base_url}{path}",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=bridge_auth_headers({"Content-Type": "application/json"}),
         method="POST",
     )
     try:

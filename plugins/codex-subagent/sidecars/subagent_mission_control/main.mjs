@@ -9,8 +9,9 @@
  */
 
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,6 +19,21 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PORT = Number(process.env.AGY_CODEX_BRIDGE_PORT || 18765);
 const BRIDGE_BASE = `http://127.0.0.1:${BRIDGE_PORT}`;
 const BRIDGE_SCRIPT = resolve(__dirname, '..', '..', 'bin', 'codex_bridge_daemon.py');
+
+function getBridgeToken() {
+  if (process.env.AGY_CODEX_BRIDGE_TOKEN) return process.env.AGY_CODEX_BRIDGE_TOKEN.trim();
+  const appDir = process.env.AGY_CODEX_APP_DATA_DIR || join(homedir(), '.gemini', 'antigravity-cli');
+  const tokPath = join(appDir, 'codex_bridge_token');
+  try {
+    if (existsSync(tokPath)) return readFileSync(tokPath, 'utf-8').trim();
+  } catch {}
+  return '';
+}
+
+function bridgeHeaders(extra = {}) {
+  const tok = getBridgeToken();
+  return tok ? { 'X-Bridge-Token': tok, ...extra } : { ...extra };
+}
 
 let SidecarAppClass = null;
 let ResponseClass = null;
@@ -64,7 +80,10 @@ try {
         const url = new URL(req.url, `http://127.0.0.1:${port}`);
         if (req.method === 'GET' && this.#pages.has(url.pathname)) {
           const html = await this.#pages.get(url.pathname)();
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'",
+          });
           res.end(html);
           return;
         }
@@ -162,7 +181,7 @@ async function bridgeGet(path, query = {}) {
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
   }
-  const resp = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  const resp = await fetch(url, { headers: bridgeHeaders(), signal: AbortSignal.timeout(15000) });
   return await resp.json();
 }
 
@@ -176,7 +195,7 @@ async function bridgePost(path, body = {}) {
   };
   const resp = await fetch(new URL(path, BRIDGE_BASE), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: bridgeHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(25000),
   });

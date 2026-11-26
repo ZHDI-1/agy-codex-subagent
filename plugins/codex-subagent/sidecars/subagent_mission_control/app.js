@@ -12,6 +12,7 @@ const state = {
   currentOnly: false,
   activeTab: 'stream',
   inspected: null,
+  pollInFlight: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -72,7 +73,11 @@ function renderRoster() {
     .map((s) => {
       const isSelected = s.conversationId === state.selectedId;
       const engineClass = s.engine === 'codex' ? 'engine-codex' : 'engine-gemini';
-      const engineLabel = s.engine === 'codex' ? `CODEX · ${s.effort || 'high'}` : `GEMINI · ${s.agentName || 'sub'}`;
+      const engineLabel = s.engine === 'codex'
+        ? `CODEX · ${s.effort || 'high'}`
+        : (s.engine && s.engine !== 'gemini'
+          ? `${String(s.engine).toUpperCase()} · ${s.model || s.agentName || 'acp'}`
+          : `GEMINI · ${s.agentName || 'sub'}`);
       const statusClass = `status-${s.status || 'idle'}`;
       const activity = s.activity || (s.status === 'working' ? 'Working…' : 'Idle');
       return `
@@ -95,7 +100,12 @@ function renderRoster() {
 
   for (const card of container.querySelectorAll('.roster-card')) {
     card.addEventListener('click', () => {
-      state.selectedId = card.getAttribute('data-conv-id');
+      const nextId = card.getAttribute('data-conv-id');
+      if (nextId !== state.selectedId) {
+        state.selectedId = nextId;
+        state.inspected = null;
+        renderInspector(null);
+      }
       renderRoster();
       pollInspect();
     });
@@ -139,7 +149,11 @@ function renderInspector(data) {
   const tr = data.transcript || {};
 
   const engineBadge = el('insp-engine-badge');
-  engineBadge.textContent = s.engine === 'codex' ? `CODEX (${s.model || 'daemon'})` : `GEMINI (${s.agentName || 'native'})`;
+  engineBadge.textContent = s.engine === 'codex'
+    ? `CODEX (${s.model || 'daemon'})`
+    : (s.engine && s.engine !== 'gemini'
+      ? `${String(s.engine).toUpperCase()} (${s.model || s.agentName || 'acp'})`
+      : `GEMINI (${s.agentName || 'native'})`);
   engineBadge.className = `engine-pill ${s.engine === 'codex' ? 'engine-codex' : 'engine-gemini'}`;
 
   el('insp-role').textContent = s.role || s.conversationId;
@@ -169,8 +183,12 @@ function renderInspector(data) {
   if (approvals.length > 0) {
     banner.classList.remove('hidden');
     const first = approvals[0];
+    banner.dataset.approvalId = first.approvalId || '';
+    banner.dataset.conversationId = s.conversationId || '';
     el('approval-desc').textContent = `${first.method}: ${JSON.stringify(first.params || {}).slice(0, 120)}`;
   } else {
+    banner.dataset.approvalId = '';
+    banner.dataset.conversationId = '';
     banner.classList.add('hidden');
   }
 
@@ -195,12 +213,13 @@ function renderInspector(data) {
         const toolsHtml = (st.tools || [])
           .map((t) => `<span class="tool-chip">${escapeHtml(t)}</span>`)
           .join('');
+        const safeStepIdx = Number.isFinite(Number(st.stepIndex)) ? Math.trunc(Number(st.stepIndex)) : 0;
         const bodyText = st.response || st.content || st.thinking || '';
         return `
           <div class="step-card">
             <div class="step-card-header">
-              <span><b>#${st.stepIndex}</b> · ${escapeHtml(st.type)} (${escapeHtml(st.status)})</span>
-              <button class="btn btn-xs btn-revert-step" data-step="${st.stepIndex}" title="Revert to this step">Revert here</button>
+              <span><b>#${safeStepIdx}</b> · ${escapeHtml(st.type)} (${escapeHtml(st.status)})</span>
+              <button class="btn btn-xs btn-revert-step" data-step="${safeStepIdx}" title="Revert to this step">Revert here</button>
             </div>
             ${toolsHtml ? `<div class="step-tools">${toolsHtml}</div>` : ''}
             ${bodyText ? `<div class="step-body">${escapeHtml(bodyText)}</div>` : ''}
@@ -267,6 +286,8 @@ async function pollInspect() {
 }
 
 async function pollAll() {
+  if (state.pollInFlight) return;
+  state.pollInFlight = true;
   try {
     const res = await apiGet('/api/mission-control', { all: 'true' });
     state.subagents = res.subagents || [];
@@ -296,6 +317,8 @@ async function pollAll() {
     }
   } catch (e) {
     console.warn('pollAll error:', e);
+  } finally {
+    state.pollInFlight = false;
   }
 }
 
@@ -438,17 +461,23 @@ document.addEventListener('DOMContentLoaded', () => {
     pollAll();
   });
 
-  // Approvals
+  // Approvals (bound to exact displayed approvalId & conversationId)
   el('btn-approve-accept').addEventListener('click', async () => {
-    if (!state.selectedId) return;
-    await apiPost('/api/subagent/approve', { conversationId: state.selectedId, decision: 'accept' });
+    const banner = el('approval-banner');
+    const convId = banner.dataset.conversationId || state.selectedId;
+    const approvalId = banner.dataset.approvalId || undefined;
+    if (!convId || !approvalId) return;
+    await apiPost('/api/subagent/approve', { conversationId: convId, approvalId, decision: 'accept' });
     showFeedback('Approved request');
     pollAll();
   });
 
   el('btn-approve-decline').addEventListener('click', async () => {
-    if (!state.selectedId) return;
-    await apiPost('/api/subagent/approve', { conversationId: state.selectedId, decision: 'decline' });
+    const banner = el('approval-banner');
+    const convId = banner.dataset.conversationId || state.selectedId;
+    const approvalId = banner.dataset.approvalId || undefined;
+    if (!convId || !approvalId) return;
+    await apiPost('/api/subagent/approve', { conversationId: convId, approvalId, decision: 'decline' });
     showFeedback('Declined request');
     pollAll();
   });

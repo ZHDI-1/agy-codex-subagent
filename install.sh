@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="${REPO_ROOT}/plugins/codex-subagent"
 GLOBAL_CONFIG="${AGY_CODEX_GLOBAL_CONFIG:-${HOME}/.gemini/config}"
-mode=preInvocation
+mode=sdkExecutor
 for arg in "$@"; do
   case "$arg" in
     --mode=preInvocation|--mode=sdkExecutor) mode="${arg#--mode=}" ;;

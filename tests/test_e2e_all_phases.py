@@ -711,8 +711,8 @@ sdk.main()
         global_config = self.root / "installer-global"
         inherited = {name: value for name, value in os.environ.items() if not name.startswith("AGY_CODEX_")}
         env = {**inherited, "AGY_CODEX_GLOBAL_CONFIG": str(global_config)}
-        for args, mode in (([], "preInvocation"), (["--mode=sdkExecutor"], "sdkExecutor"),
-                           (["--mode=preInvocation"], "preInvocation")):
+        for args, mode in (([], "sdkExecutor"), (["--mode=preInvocation"], "preInvocation"),
+                           (["--mode=sdkExecutor"], "sdkExecutor")):
             proc = subprocess.run(["bash", "./install.sh", *args], cwd=checkout, env=env,
                                   capture_output=True, text=True, timeout=10)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

@@ -1,5 +1,5 @@
 {
-  "executionMode": "preInvocation",
+  "executionMode": "sdkExecutor",
   "permissionSource": "codexConfig",
   "model": "gpt-6.2-sol",
   "effort": "xhigh",

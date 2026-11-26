@@ -1,0 +1,16 @@
+{
+  "name": "agy-neon-med",
+  "description": "Antigravity subagent pinned to Gemini 4 Neon (Medium) for balanced coding and analysis",
+  "subagent": true,
+  "mainAgent": false,
+  "disableModelSelection": true,
+  "commandSpec": {
+    "command": "/usr/bin/python3",
+    "args": [
+      "-u",
+      "/home/zhdi/build_part/agy_subagent/plugins/codex-subagent/bin/codex_sdk_executor.py",
+      "--agent-name",
+      "agy-neon-med"
+    ]
+  }
+}

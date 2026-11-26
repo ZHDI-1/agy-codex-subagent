@@ -23,7 +23,7 @@ GLOBAL_CONFIG = Path(os.environ.get("AGY_CODEX_GLOBAL_CONFIG", Path.home() / ".g
 GLOBAL_AGENTS = Path(os.environ.get("AGY_CODEX_GLOBAL_AGENTS", GLOBAL_CONFIG / "agents"))
 CODEX_CONFIG_TOML = Path(os.environ.get("CODEX_CONFIG_TOML", Path.home() / ".codex/config.toml"))
 EXECUTION_MODES = ("preInvocation", "sdkExecutor")
-BACKENDS = ("codex", "agy")
+BACKENDS = ("codex", "agy", "acp", "pi")
 PERMISSION_SOURCES = ("codexConfig", "bypass", "custom")
 EFFORTS = ("low", "medium", "high", "xhigh", "ultra")
 SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access", "inherit")
@@ -139,8 +139,17 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{field} must be one of {', '.join(options)}")
     for field in ("model", "description", "systemPrompt"):
         value = settings.get(field, "")
-        if not isinstance(value, str) or (field == "model" and not value.strip()):
+        if not isinstance(value, str) or (field == "model" and not value.strip() and settings.get("backend") in ("codex", "agy")):
             raise ValueError(f"{field} must be a valid string")
+    if settings.get("backend") == "acp":
+        acp_cmd = settings.get("acpCommand")
+        if not isinstance(acp_cmd, list) or not acp_cmd or not all(isinstance(x, str) and x.strip() for x in acp_cmd):
+            raise ValueError("acpCommand must be a non-empty list of strings when backend is 'acp'")
+    if "acpEnv" in settings and settings["acpEnv"] is not None:
+        if not isinstance(settings["acpEnv"], dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in settings["acpEnv"].items()
+        ):
+            raise ValueError("acpEnv must be an object mapping string keys to string values")
     if "minRemainingQuotaPercent" in settings and settings["minRemainingQuotaPercent"] is not None:
         raw_q = settings["minRemainingQuotaPercent"]
         if isinstance(raw_q, bool) or not isinstance(raw_q, (int, float)) or not (0 <= int(raw_q) <= 100):
@@ -167,6 +176,17 @@ def normalize_profile(data: dict[str, Any], previous: dict[str, Any] | None = No
             defaults[field] = data[field]
     if defaults.get("backend") == "agy" and "model" not in data and (not previous or previous.get("backend") != "agy"):
         defaults["model"] = "gemini-4-neon-high"
+    elif defaults.get("backend") in ("acp", "pi") and "model" not in data and (
+        not previous or previous.get("backend") != defaults.get("backend")
+    ):
+        defaults["model"] = ""
+    for opt_field in ("acpCommand", "acpEnv", "acpMode", "provider"):
+        if previous and opt_field in previous:
+            defaults[opt_field] = previous[opt_field]
+        if opt_field in data and data[opt_field] not in (None, "", [], {}):
+            defaults[opt_field] = data[opt_field]
+        elif opt_field in data and data[opt_field] in (None, "", [], {}):
+            defaults.pop(opt_field, None)
     if "permissionSource" not in data and (
         (data.get("sandboxMode") not in (None, "", "inherit"))
         or (data.get("approvalPolicy") not in (None, "", "inherit"))

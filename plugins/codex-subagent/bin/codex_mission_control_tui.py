@@ -341,7 +341,12 @@ class MissionControlTUI:
                     s = visible[idx]
                     y = 2 + row_offset
                     is_sel = idx == self.selected_idx
-                    eng = "CODEX " if s.get("engine") == "codex" else ("AGY   " if s.get("engine") == "agy" else "GEMINI")
+                    eng = {
+                        "codex": "CODEX ",
+                        "agy": "AGY   ",
+                        "pi": "PI    ",
+                        "acp": "ACP   ",
+                    }.get(str(s.get("engine") or "").lower(), "GEMINI")
                     st = str(s.get("status") or "idle").upper()
                     role = str(s.get("role") or s.get("agentName") or s.get("conversationId"))[:28]
                     steps = s.get("steps", 0)
@@ -427,7 +432,7 @@ class MissionControlTUI:
                 self.refresh_data(force_detail=True)
                 self.status_banner = f"Switched scope to {'All History' if self.show_all else 'Current Session'}"
             elif ch == ord("f"):
-                order = ["all", "codex", "agy", "gemini"]
+                order = ["all", "codex", "agy", "pi", "acp", "gemini"]
                 self.engine_filter = order[(order.index(self.engine_filter) + 1) % len(order)]
                 self.selected_idx = 0
                 self.selected_conv_id = ""

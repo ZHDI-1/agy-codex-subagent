@@ -405,6 +405,69 @@ class TestExecutorAndProfiles(unittest.TestCase):
         self.assertEqual(sw["model"], "gemini-4-neon-xhigh")
         self.assertTrue(any(m == "session/set_model" and p["modelId"] == "gemini-4-neon-xhigh" for m, p in agy_calls))
 
+    def test_generic_acp_and_pi_backends_in_registry(self):
+        # 1. Verify backend registry lists all 4 built-in backends
+        backends = {b["name"]: b for b in self.bridge.list_backends()["backends"]}
+        self.assertEqual(set(backends.keys()), {"codex", "agy", "acp", "pi"})
+        self.assertTrue(backends["acp"]["capabilities"]["customCommand"])
+        self.assertTrue(backends["pi"]["capabilities"]["midTurnSteer"])
+
+        # 2. Verify generic `acp` profile with custom acpCommand
+        acp_prof = self.bridge.define_profile({
+            "name": "custom-acp-agent",
+            "backend": "acp",
+            "acpCommand": ["pi-acp", "--stdio"],
+            "acpEnv": {"FOO": "BAR"},
+            "model": "anthropic/claude-sonnet-4",
+            "executionMode": "sdkExecutor",
+        })["profile"]
+        self.assertEqual(acp_prof["backend"], "acp")
+        self.assertEqual(acp_prof["acpCommand"], ["pi-acp", "--stdio"])
+
+        # 3. Verify native `pi` backend dispatch, steer, and completion lifecycle
+        pi_cmds = []
+
+        class FakePiProc:
+            def __init__(self, bridge, sid):
+                self.bridge = bridge
+                self.sid = sid
+
+            def is_running(self):
+                return True
+
+            def command(self, cmd_type, payload=None, timeout=30.0):
+                pi_cmds.append((cmd_type, payload or {}))
+                if cmd_type == "prompt":
+                    self.bridge._on_pi_event(self.sid, {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "PI_PONG_OK"},
+                    })
+                return {}
+
+            def close(self):
+                pass
+
+        fake_pi = FakePiProc(self.bridge, "pi-pi-conv-1")
+        with patch.object(self.bridge.backends.pi, "get_or_create", return_value=fake_pi), \
+             patch.object(self.bridge.backends.pi, "get", return_value=fake_pi):
+            res = self.bridge.dispatch_subagent_input(
+                "pi-conv-1", "Check repo", backend="pi", model="openai-codex/gpt-5.6-sol"
+            )
+            self.assertEqual(res["backend"], "pi")
+            self.assertEqual(res["action"], "turn/start")
+
+            # Native mid-turn steer while active
+            steer = self.bridge.dispatch_subagent_input("pi-conv-1", "Focus on tests only")
+            self.assertEqual(steer["action"], "pi/steer")
+            self.assertEqual(steer["status"], "steered")
+
+            # Complete turn via agent_end
+            self.bridge._on_pi_event("pi-pi-conv-1", {"type": "agent_end"})
+            insp = self.bridge.inspect_subagent("pi-conv-1")
+            self.assertEqual(insp["summary"]["engine"], "pi")
+            self.assertIn("PI_PONG_OK", insp["transcript"]["lastResponse"])
+            self.assertEqual([c[0] for c in pi_cmds], ["prompt", "steer"])
+
     def test_serialized_dispatch_steers_and_cleans_approvals(self):
         conv = "concurrent"
         with ThreadPoolExecutor(2) as workers:
@@ -960,6 +1023,7 @@ class TestCodexSubagentAllPhases(unittest.TestCase):
                 "subagent_handoff",
                 "subagent_define_profile",
                 "subagent_list_profiles",
+                "subagent_list_backends",
                 "subagent_list_agy_models",
                 "subagent_check_codex_quota",
                 "subagent_list_codex_sessions",

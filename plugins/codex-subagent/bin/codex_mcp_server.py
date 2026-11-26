@@ -67,10 +67,10 @@ MCP_TOOLS: List[Dict[str, Any]] = [
     {
         "name": "subagent_define_profile",
         "description": (
-            "Create or update a subagent profile (backend='codex' or backend='agy') and register "
-            "its native Antigravity subagent type. With backend='agy', you can pin any exact Antigravity "
-            "model ID (e.g. 'claude-opus-5-5-high', 'claude-sonnet-5-5-high', 'gemini-4-neon-xhigh', "
-            "'gemini-4-argon-high', 'gpt-oss-120b-medium') via `agy acp`!"
+            "Create or update a subagent profile for any supported backend (`codex`, `agy`, generic `acp`, or `pi`) "
+            "and register its native Antigravity subagent type. Use `backend='agy'` for exact Antigravity models "
+            "(`claude-opus-5-5-high`, `gemini-4-neon-xhigh`, etc.), `backend='pi'` for Pi Coding Agent (`pi --mode rpc`), "
+            "or `backend='acp'` with `acpCommand` for any ACP-compatible agent (`pi-acp`, `claude-code-acp`, `opencode acp`, etc.)."
         ),
         "inputSchema": {
             "type": "object",
@@ -80,12 +80,24 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                 "backend": {
                     "type": "string",
                     "enum": BACKENDS,
-                    "description": "'codex' (default, OpenAI Codex app-server) or 'agy' (Antigravity ACP with exact model selection).",
+                    "description": "'codex' (default), 'agy' (Antigravity ACP), 'acp' (generic ACP server), or 'pi' (Pi Coding Agent RPC).",
                 },
                 "description": {"type": "string"},
                 "model": {"type": "string"},
+                "provider": {"type": "string", "description": "Optional provider name (used by `pi` backend, e.g. 'google', 'anthropic', 'openai-codex')."},
                 "effort": {"type": "string", "enum": EFFORTS},
                 "systemPrompt": {"type": "string"},
+                "acpCommand": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Command argv for generic `acp` backend (e.g. ['pi-acp'] or ['claude-code-acp']).",
+                },
+                "acpEnv": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Optional extra environment variables for generic `acp` backend.",
+                },
+                "acpMode": {"type": "string", "description": "Optional ACP session mode (e.g. 'auto', 'accept-edits', 'plan')."},
                 "executionMode": {"type": "string", "enum": EXECUTION_MODES},
                 "permissionSource": {
                     "type": "string",
@@ -103,7 +115,12 @@ MCP_TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "subagent_list_profiles",
-        "description": "List saved Codex & AGY profiles and defaults for new profiles (including ~/.codex/config.toml permissions).",
+        "description": "List saved subagent profiles across all backends (codex, agy, acp, pi) and defaults.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "subagent_list_backends",
+        "description": "List all registered subagent backends (`codex`, `agy`, `acp`, `pi`), their protocols, availability, and capabilities.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -428,8 +445,8 @@ MCP_TOOLS: List[Dict[str, Any]] = [
                 },
                 "targetEngine": {
                     "type": "string",
-                    "enum": ["codex", "agy", "gemini"],
-                    "description": "Target engine to hand off to ('codex', 'agy', or 'gemini').",
+                    "enum": ["codex", "agy", "acp", "pi", "gemini"],
+                    "description": "Target engine to hand off to ('codex', 'agy', 'acp', 'pi', or 'gemini').",
                 },
                 "prompt": {
                     "type": "string",
@@ -451,6 +468,8 @@ def handle_tool_call(name: str, args: Dict[str, Any]) -> Any:
         return bridge_post("/api/profiles/define", args)
     if name == "subagent_list_profiles":
         return bridge_get("/api/profiles")
+    if name == "subagent_list_backends":
+        return bridge_get("/api/backends")
     if name == "subagent_list_agy_models":
         return bridge_get("/api/agy/models")
     if name == "subagent_check_codex_quota":

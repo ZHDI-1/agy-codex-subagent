@@ -614,7 +614,11 @@ class TestExecutorAndProfiles(unittest.TestCase):
             hook_module.main()
         self.assertEqual(post.call_args.args[2]["agentName"], "codex-audit")
         self.assertEqual(post.call_args.args[2]["executionMode"], "preInvocation")
-        self.assertEqual(json.loads(output.getvalue())["terminationBehavior"], "terminate")
+        hook_json = json.loads(output.getvalue())
+        self.assertEqual(hook_json["terminationBehavior"], "terminate")
+        # Regression: agy's ScrubInternalFields panics on map<string,string> (metadata) in PreInvocation injectSteps
+        for step in hook_json.get("injectSteps", []):
+            self.assertNotIn("metadata", step.get("systemMessage", {}))
 
     def test_sdk_process_ndjson_steer_sigint_and_idle(self):
         # Run the real stdin and signal loop. Intercept only the network boundary.

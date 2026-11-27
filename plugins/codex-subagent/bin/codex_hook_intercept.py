@@ -271,9 +271,9 @@ def main() -> None:
         print(json.dumps({
             "terminationBehavior": "terminate",
             "injectSteps": [{
-                "systemMessage": {"systemMessage": "", "metadata": {
-                    "user_markdown": f"Codex accepted `{result.get('action')}` for {role or 'Codex Subagent'}."
-                }},
+                "systemMessage": {
+                    "systemMessage": f"Routed `{result.get('action')}` for {role or 'Subagent'}.",
+                },
             }],
         }))
     except Exception as exc:
